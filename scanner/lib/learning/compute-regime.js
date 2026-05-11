@@ -497,7 +497,17 @@ function pickStrategyHint(regime) {
 // Utils
 // ---------------------------------------------------------------------------
 
-function toFiniteOrNull(x) { const n = Number(x); return Number.isFinite(n) ? n : null; }
+// 2026-05-12 — null/undefined giriste null don. Eskiden Number(null)===0
+// kosulu ile null degerler 0'a kayiyordu; BIST sub-regime klasifiye edicide
+// `usdtrySigma = toFiniteOrNull(null) = 0` ve `rho = 0` → `0 < 0.005` ve
+// `|0| < 0.3` her cycle dogru cikti → 748/748 BIST kaydi sahte
+// `bist_tl_stable_domestic` etiketiyle damgalanmisti. Ayni sorun us_stocks
+// vix yolu ve adx null durumu icin de gizli bicimde mevcuttu.
+function toFiniteOrNull(x) {
+  if (x == null) return null;
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
 function toIntOrNull(x) { const n = Number.parseInt(x, 10); return Number.isFinite(n) ? n : null; }
 function fmt(x) { return x == null ? 'null' : Number(x).toFixed(3); }
 
