@@ -64,7 +64,7 @@
 function el(t,a,c){var n=document.createElement(t);if(a)for(var k in a){if(k==='className')n.className=a[k];else if(k==='textContent')n.textContent=a[k];else if(k==='style'&&typeof a[k]==='object')Object.assign(n.style,a[k]);else if(k==='onclick')n.onclick=a[k];else n.setAttribute(k,a[k]);}if(c){var arr=Array.isArray(c)?c:[c];for(var i=0;i<arr.length;i++){if(typeof arr[i]==='string')n.appendChild(document.createTextNode(arr[i]));else if(arr[i])n.appendChild(arr[i]);}}return n;}
 function clear(node){while(node.firstChild)node.removeChild(node.firstChild);}
 function fmt(v){return v==null||!isFinite(v)?'-':Number(v).toFixed(4).replace(/\.?0+$/,'');}
-function fmtPnl(v){return v==null||!isFinite(v)?'?':(v>=0?'+':'')+Number(v).toFixed(2)+'R';}
+function fmtPnl(v){return v==null||!isFinite(v)?'?':(v>=0?'+$':'-$')+Math.abs(Number(v)).toFixed(2);}
 
 var allSignals = [];
 var currentFilter = 'all';
@@ -142,7 +142,8 @@ function renderCard(s) {
   var oc = s.outcome || s.status;
   var hitPx = s.tp3HitPrice || s.tp2HitPrice || s.tp1HitPrice || s.slHitPrice || null;
   var statusText = oc + (hitPx ? ' @ ' + fmt(hitPx) : '');
-  if (s.actualRR != null) statusText += ' | ' + fmtPnl(s.actualRR);
+  if (s.pnlPct != null) statusText += ' | ' + fmtPnl(s.pnlPct);
+  else if (s.actualRR != null) statusText += ' | ' + (s.actualRR >= 0 ? '+' : '') + Number(s.actualRR).toFixed(2) + 'R';
   head.appendChild(el('span', { className: 'outcome-' + cls, textContent: statusText }));
   card.appendChild(head);
 

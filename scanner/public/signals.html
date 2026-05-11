@@ -360,7 +360,7 @@
         <th data-sort="entry">Entry <span class="sort-arrow"></span></th>
         <th data-sort="currentPrice">Guncel <span class="sort-arrow"></span></th>
         <th data-sort="pnlPct">P&amp;L % <span class="sort-arrow"></span></th>
-        <th data-sort="pnlR">P&amp;L (R) <span class="sort-arrow"></span></th>
+        <th data-sort="pnlPct">P&amp;L ($) <span class="sort-arrow"></span></th>
         <th data-sort="slDistance">SL Uzaklik <span class="sort-arrow"></span></th>
         <th>TP Durumu</th>
         <th data-sort="ageMinutes">Yas <span class="sort-arrow"></span></th>
@@ -561,11 +561,13 @@ function computeSummary(list) {
   var profitable = active.filter(function(x) { return effectivePnl(x).pnlPct > 0; }).length;
   var losing = active.filter(function(x) { return effectivePnl(x).pnlPct < 0; }).length;
   var pending = totalOpen - active.length;
-  var avgPnlPct = active.length > 0 ? Math.round(active.reduce(function(s, x) { return s + effectivePnl(x).pnlPct; }, 0) / active.length * 100) / 100 : 0;
+  var sumPnlPct = active.reduce(function(s, x) { return s + effectivePnl(x).pnlPct; }, 0);
+  var avgPnlPct = active.length > 0 ? Math.round(sumPnlPct / active.length * 100) / 100 : 0;
+  var totalPnlUsd = Math.round(sumPnlPct * 100) / 100; // $100 base => sum of pct == sum of $
   var avgPnlR = active.length > 0 ? Math.round(active.reduce(function(s, x) { return s + effectivePnl(x).pnlR; }, 0) / active.length * 100) / 100 : 0;
   var byGrade = {};
   list.forEach(function(x) { byGrade[x.grade] = (byGrade[x.grade] || 0) + 1; });
-  return { totalOpen: totalOpen, profitable: profitable, losing: losing, pending: pending, avgPnlPct: avgPnlPct, avgPnlR: avgPnlR, byGrade: byGrade };
+  return { totalOpen: totalOpen, profitable: profitable, losing: losing, pending: pending, avgPnlPct: avgPnlPct, avgPnlR: avgPnlR, totalPnlUsd: totalPnlUsd, byGrade: byGrade };
 }
 
 function getLeagueList() {
@@ -578,7 +580,7 @@ function getLeagueList() {
 function renderSummary() {
   var bar = document.getElementById('summaryBar');
   while (bar.firstChild) bar.removeChild(bar.firstChild);
-  var s = computeSummary(getLeagueList());
+  var s = computeSummary(getFiltered());
 
   var stats = [
     { label: 'Toplam Acik', value: String(s.totalOpen || 0), cls: 'neutral' },
@@ -586,7 +588,7 @@ function renderSummary() {
     { label: 'Karda', value: String(s.profitable || 0), cls: 'positive' },
     { label: 'Zararda', value: String(s.losing || 0), cls: 'negative' },
     { label: 'Ort. P&L %', value: (s.avgPnlPct >= 0 ? '+' : '') + (s.avgPnlPct || 0) + '%', cls: s.avgPnlPct >= 0 ? 'positive' : 'negative' },
-    { label: 'Ort. P&L (R)', value: (s.avgPnlR >= 0 ? '+' : '') + (s.avgPnlR || 0) + 'R', cls: s.avgPnlR >= 0 ? 'positive' : 'negative' },
+    { label: 'Toplam P&L ($)', value: (s.totalPnlUsd >= 0 ? '+$' : '-$') + Math.abs(s.totalPnlUsd || 0).toFixed(2), cls: s.totalPnlUsd >= 0 ? 'positive' : 'negative' },
   ];
 
   stats.forEach(function(st) {
@@ -608,6 +610,19 @@ function renderSummary() {
   bar.appendChild(pills);
 }
 
+var CATEGORY_ALIASES = {
+  crypto: 'kripto', kripto: 'kripto',
+  forex: 'forex',
+  us_stock: 'abd_hisse', abd_hisse: 'abd_hisse',
+  bist: 'bist',
+  commodity: 'emtia', emtia: 'emtia',
+};
+function normalizeCategory(c) {
+  if (!c) return c;
+  var k = String(c).toLowerCase();
+  return CATEGORY_ALIASES[k] || k;
+}
+
 function getFiltered() {
   var cat = document.getElementById('filterCategory').value;
   var grade = document.getElementById('filterGrade').value;
@@ -617,7 +632,7 @@ function getFiltered() {
   return allSignals.filter(function(s) {
     // 3-tier ladder: league alaniyla filtrele
     if (leagueFilter !== 'all' && signalLeague(s) !== leagueFilter) return false;
-    if (cat !== 'all' && s.category !== cat) return false;
+    if (cat !== 'all' && normalizeCategory(s.category) !== cat) return false;
     if (grade !== 'all' && s.grade !== grade) return false;
     if (dir !== 'all' && s.direction !== dir) return false;
     if (pnl === 'positive' && s.pnlPct <= 0) return false;
@@ -782,8 +797,9 @@ function renderTable() {
     if (entryPending) {
       tdPnlR = el('td', { className: 'pnl-r-cell pnl-neutral', textContent: '—', style: { color: 'var(--text2)' } });
     } else {
-      var pnlRCls = s.pnlR > 0 ? 'pnl-positive' : s.pnlR < 0 ? 'pnl-negative' : 'pnl-neutral';
-      tdPnlR = el('td', { className: 'pnl-r-cell ' + pnlRCls, textContent: (s.pnlR > 0 ? '+' : '') + s.pnlR + 'R' });
+      var pnlUsd = Number(s.pnlPct) || 0;
+      var pnlUsdCls = pnlUsd > 0 ? 'pnl-positive' : pnlUsd < 0 ? 'pnl-negative' : 'pnl-neutral';
+      tdPnlR = el('td', { className: 'pnl-r-cell ' + pnlUsdCls, textContent: (pnlUsd >= 0 ? '+$' : '-$') + Math.abs(pnlUsd).toFixed(2) });
     }
     tr.appendChild(tdPnlR);
 
@@ -964,7 +980,7 @@ function showDetail(s) {
     ['Entry Tetiklendi', s.entryHitAt ? new Date(s.entryHitAt).toLocaleString('tr-TR') : (entryPending ? '— (bekliyor)' : '-')],
     ['Guncel Fiyat', fmt(s.currentPrice)],
     ['P&L %', entryPending ? '— (entry bekliyor)' : (s.pnlPct > 0 ? '+' : '') + s.pnlPct + '%'],
-    ['P&L (R)', entryPending ? '— (entry bekliyor)' : (s.pnlR > 0 ? '+' : '') + s.pnlR + 'R'],
+    ['P&L ($)', entryPending ? '— (entry bekliyor)' : (s.pnlPct >= 0 ? '+$' : '-$') + Math.abs(Number(s.pnlPct) || 0).toFixed(2)],
     ['SL', fmt(s.sl)],
     ['SL Uzaklik', s.slDistance != null ? s.slDistance + '%' : '-'],
     ['R:R', s.rr || '-'],
@@ -1328,12 +1344,12 @@ function recomputeRowMetrics(tr, price) {
     }
   }
 
-  // P&L R hucresini guncelle
+  // P&L $ hucresini guncelle ($100 tabanli — pnlPct dolar olarak)
   var pnlRCell = tr.querySelector('.pnl-r-cell');
   if (pnlRCell && entryActive) {
-    pnlRCell.textContent = (pnlR > 0 ? '+' : '') + pnlR + 'R';
+    pnlRCell.textContent = (pnlPct >= 0 ? '+$' : '-$') + Math.abs(pnlPct).toFixed(2);
     pnlRCell.classList.remove('pnl-positive', 'pnl-negative', 'pnl-neutral');
-    pnlRCell.classList.add(pnlR > 0 ? 'pnl-positive' : pnlR < 0 ? 'pnl-negative' : 'pnl-neutral');
+    pnlRCell.classList.add(pnlPct > 0 ? 'pnl-positive' : pnlPct < 0 ? 'pnl-negative' : 'pnl-neutral');
   }
 
   // SL uzaklik hucresini guncelle

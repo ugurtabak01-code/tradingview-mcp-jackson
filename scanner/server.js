@@ -37,7 +37,7 @@ import { runHTFFibJob, ensureHTFFibCache, isFibCacheStale, loadFibCache, HTF_FIB
 import { formatBarrierFibBasis } from './lib/alignment-filters.js';
 import { startLivePriceFeed, getLivePrice, getAllLivePrices, getFeedStats, getFeedHealth, registerSymbols as registerLiveSymbols } from './lib/live-price-feed.js';
 import { wrapBroadcast as wrapLiveOutcome } from './lib/learning/live-outcome-processor.js';
-import { startYahooPriceFeed, getAllYahooPrices, getYahooFeedStats, registerSymbolsByCategory as registerYahooByCategory, registerSymbols as registerYahooSymbols } from './lib/yahoo-price-feed.js';
+import { startYahooPriceFeed, getAllYahooPrices, getYahooFeedStats, getYahooPrice, registerSymbolsByCategory as registerYahooByCategory, registerSymbols as registerYahooSymbols } from './lib/yahoo-price-feed.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3838;
@@ -299,11 +299,10 @@ app.post('/api/emergency/cancel-all', async (_req, res) => {
   }
 });
 
-// --- Live Price Feed (Binance WS + Yahoo REST) ---
+// --- Live Price Feed (Binance WS + TV Watchlist via CDP) ---
 app.get('/api/live-prices', (req, res) => {
   const binance = getAllLivePrices();
   const yahoo = getAllYahooPrices();
-  // Birlestir — kripto ile Yahoo tv-sembolleri cakismaz (MON vs MONUSDT gibi degil)
   const prices = Object.assign({}, yahoo, binance);
   res.json({
     prices,
@@ -313,7 +312,7 @@ app.get('/api/live-prices', (req, res) => {
 
 app.get('/api/live-prices/:symbol', (req, res) => {
   const sym = req.params.symbol;
-  const price = getLivePrice(sym);
+  const price = getLivePrice(sym) ?? getYahooPrice(sym);
   res.json({ symbol: sym, price, ts: Date.now() });
 });
 
@@ -1142,6 +1141,20 @@ app.get('/api/signals/closed-24h', (req, res) => {
       const tb = new Date(b.resolvedAt || b.entryExpiredAt || b.updatedAt || b.createdAt || 0).getTime();
       return tb - ta;
     });
+    const computeRealizedPnlPct = (s) => {
+      if (!s.entry || !Number.isFinite(s.entry)) return null;
+      if (s.entryHit === false) return null;
+      let exitPx = null;
+      if (s.status === 'trailing_stop_exit' && s.slHitPrice != null) exitPx = s.slHitPrice;
+      else if (s.tp3Hit && s.tp3 != null) exitPx = s.tp3;
+      else if (s.tp2Hit && s.tp2 != null) exitPx = s.tp2;
+      else if (s.tp1Hit && s.tp1 != null) exitPx = s.tp1;
+      else if (s.slHit && (s.slHitPrice != null || s.sl != null)) exitPx = s.slHitPrice != null ? s.slHitPrice : s.sl;
+      else if (s.lastCheckedPrice != null) exitPx = s.lastCheckedPrice;
+      if (exitPx == null || !Number.isFinite(exitPx)) return null;
+      const reward = s.direction === 'long' ? (exitPx - s.entry) : (s.entry - exitPx);
+      return Math.round((reward / s.entry) * 10000) / 100;
+    };
     const enriched = recent.map(s => ({
       id: s.id,
       symbol: s.symbol,
@@ -1163,6 +1176,7 @@ app.get('/api/signals/closed-24h', (req, res) => {
       outcome: s.outcome || s.status,
       win: s.win != null ? !!s.win : null,
       actualRR: s.actualRR != null ? s.actualRR : null,
+      pnlPct: computeRealizedPnlPct(s),
       rr: s.rr || null,
       entrySource: s.entrySource || null,
       entryHit: s.entryHit !== false,
