@@ -19,11 +19,18 @@ scanner/data/
 # macOS finder cope
 .DS_Store
 
-# API anahtarlari / secret
+# API anahtarlari / secret — never commit (Codex 1ada068)
 .env
 .env.*
+!.env.example
 *.key
 *.pem
+
+# Install-time symlink created by the one-shot setup (Codex 1ada068).
+# NOT: AGENTS.md halen tracked durumda — bu kural sadece kullanıcı dosyayi
+# elle silerse repoda gozukmemesini saglar. Tracked'tan cikarmak istenirse
+# `git rm --cached AGENTS.md` gerekir.
+AGENTS.md
 
 # Test coverage output (Konu 4) — npm run test:coverage:lcov uretir
 scanner/coverage/
