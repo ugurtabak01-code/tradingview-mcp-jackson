@@ -171,12 +171,12 @@ export function evaluateAnomaly() {
 
   const previousMode = state.mode;
 
-  // Mod gecisi — 2026-04-27'ye kadar askida.
-  // Yeni strateji/oylama matematigi sonrasi sistemin 1 hafta boyunca kendi
-  // dengesini bulmasi icin otomatik degraded'e GECMEYIZ; tetikleyicileri
-  // "muted" olarak kaydederiz, operator gorunurlugu icin. Recovery ve manuel
-  // clear normal calisir. Tarih gecince blok kalkar.
-  const DEGRADED_ENTRY_DISABLED_UNTIL = Date.UTC(2026, 3, 27); // 2026-04-27
+  // Mod gecisi — 2026-05-12'ye kadar askida (operator uzatti 2026-05-10).
+  // Yeni strateji/oylama matematigi sonrasi sistemin kendi dengesini bulmasi
+  // icin otomatik degraded'e GECMEYIZ; tetikleyicileri "muted" olarak
+  // kaydederiz, operator gorunurlugu icin. Recovery ve manuel clear normal
+  // calisir. Tarih gecince blok kalkar.
+  const DEGRADED_ENTRY_DISABLED_UNTIL = Date.UTC(2026, 4, 12); // 2026-05-12
   const entryBlocked = Date.now() < DEGRADED_ENTRY_DISABLED_UNTIL;
 
   if (triggers.length > 0 && state.mode === 'normal' && !entryBlocked) {
@@ -193,7 +193,7 @@ export function evaluateAnomaly() {
       at: new Date().toISOString(),
       event: 'muted_trigger',
       triggers,
-      note: 'auto-degraded askida (2026-04-27 oncesi)',
+      note: 'auto-degraded askida (2026-05-12 oncesi)',
     });
   } else if (state.mode === 'degraded') {
     // Recovery check
