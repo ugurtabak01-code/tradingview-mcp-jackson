@@ -937,6 +937,15 @@ async function _scanShortTermInner(symbol, options = {}) {
   });
   const bestSignal = tfSignals[0] || { grade: 'IPTAL', symbol, error: 'Sinyal yok' };
 
+  // REGIME_GATES kalibrasyonu icin instrumentation (2026-05-12).
+  // bestSignal per-TF gradeShortTermSignal cagrisinda mtfAlignment=null aliyordu
+  // (mtfConfirmation tum TF'ler grade'lendikten SONRA hesaplaniyor). Burada
+  // mtfConfirmation.agreement degerini bestSignal'e post-hoc set ediyoruz ki
+  // signal-tracker archive record'a yazabilsin. Davranisa etki etmez.
+  if (bestSignal && mtfConfirmation && mtfConfirmation.agreement != null) {
+    bestSignal.mtfAlignment = mtfConfirmation.agreement;
+  }
+
   // Apply MTF confirmation: aligned = note, mixed = downgrade, opposed = BEKLE
   if (mtfConfirmation && bestSignal.grade && bestSignal.grade !== 'IPTAL' && bestSignal.grade !== 'HATA') {
     bestSignal.reasoning = bestSignal.reasoning || [];

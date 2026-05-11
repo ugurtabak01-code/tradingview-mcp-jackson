@@ -841,6 +841,15 @@ export function gradeShortTermSignal({
     // okumaz; sadece dashboard / API / learning replay icin gozlem datasi.
     shadowMetrics: null,
     shadowVotes: null,
+    // REGIME_GATES kalibrasyonu icin instrumentation (2026-05-12). Hicbir
+    // gate'i etkilemez — sadece archive record'a tasinabilir hale getirir,
+    // boylece sonraki haftalarda gercek outcome bucket'lariyla esleme
+    // mumkun olur. htfConfidence per-TF gradeShortTermSignal cagrisinda
+    // dolu; mtfAlignment per-TF call'da null (mtfConfirmation tum TF'ler
+    // toplandiktan sonra hesaplandigi icin), scanner-engine bestSignal
+    // uzerinde post-hoc set eder.
+    htfConfidence,
+    mtfAlignment,
   };
 
   // ====================================================================

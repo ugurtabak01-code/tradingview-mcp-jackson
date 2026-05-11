@@ -786,6 +786,13 @@ export function recordSignal(scanResult) {
     shadowVotes: Array.isArray(scanResult.shadowVotes) ? scanResult.shadowVotes : null,
     shadowMtfScore: scanResult.shadowMtfScore || scanResult.shadowMetrics?.mtfScore || null,
 
+    // REGIME_GATES kalibrasyonu icin instrumentation (2026-05-12).
+    // htfConfidence per-TF gradeShortTermSignal sonucundan; mtfAlignment
+    // scanner-engine bestSignal'e tum TF'ler tamamlandiktan sonra yaziyor.
+    // Gate karari icin canli kullanilmiyor — sadece outcome bucket eslemesi.
+    htfConfidence: scanResult.htfConfidence != null ? Number(scanResult.htfConfidence) : null,
+    mtfAlignment: scanResult.mtfAlignment != null ? Number(scanResult.mtfAlignment) : null,
+
     // Grading detail
     reasoning: scanResult.reasoning || [],
     warnings: scanResult.warnings || [],
