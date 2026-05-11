@@ -19,6 +19,7 @@ import { recordOutcome as recordLadderOutcome, isLadderEligibleTF } from './ladd
 import { evaluateSignalOutcome, isTerminal, buildArchiveRecord } from './outcome-checker.js';
 import { isMarketTradeable } from '../market-hours.js';
 import { inferCategory } from '../symbol-resolver.js';
+import { maybeDispatchSlAmend } from './sl-amend-trigger.js';
 
 let _broadcast = null;
 const _inflight = new Set(); // signalId -> tick processing flag
@@ -45,12 +46,23 @@ export function processLivePriceUpdate(update) {
   for (const sig of matches) {
     if (_inflight.has(sig.id)) continue;
     if (isTerminal(sig.status, sig)) continue;
-    // Market-hours gate: kapali piyasalarda (hafta sonu hisse vb.) Yahoo/Binance
-    // tick'leri stale veri uretebilir; outcome update tetiklenmesin.
-    const cat = sig.category || inferCategory(sig.symbol);
-    if (cat && cat !== 'kripto' && !isMarketTradeable(cat)) continue;
     _inflight.add(sig.id);
     try {
+      // Market-hours gate: kapali piyasalarda (hafta sonu hisse vb.) Yahoo
+      // tick'leri Cuma kapanis degerini doner. Barrier (entry/SL/TP) kontrolunu
+      // atla, ama lastCheckedPrice/At guncelle ki dashboard guncel kalsin.
+      const cat = sig.category || inferCategory(sig.symbol);
+      const marketClosed = cat && cat !== 'kripto' && !isMarketTradeable(cat);
+      if (marketClosed) {
+        try {
+          updateSignal(sig.id, {
+            lastCheckedPrice: price,
+            lastCheckedAt: new Date(update.ts || Date.now()).toISOString(),
+            checkCount: (sig.checkCount || 0) + 1,
+          });
+        } catch (e) { /* tracker yazma hatasini sessiz gec */ }
+        continue;
+      }
       const updates = evaluateSignalOutcome(sig, bar);
       if (!updates) continue;
 
@@ -62,6 +74,11 @@ export function processLivePriceUpdate(update) {
 
       const updated = updateSignal(sig.id, updates);
       if (!updated) continue;
+
+      // TP1 transition: native trailing-stop kurulumu için executor'a tek
+      // seferlik amend gönder (idempotent helper). prev=sig, after=updated.
+      try { maybeDispatchSlAmend(sig, updated); }
+      catch (e) { console.log(`[LiveOutcome] sl-amend trigger hatası (${sig.id}): ${e.message}`); }
 
       const becameTerminal = isTerminal(updated.status, updated);
       if (becameTerminal) {

@@ -9,6 +9,7 @@
 import { getOpenSignals, updateSignal, removeOpenSignal, diffIndicators, validateSignalPriceLevels } from './signal-tracker.js';
 import { appendToArchive } from './persistence.js';
 import { classifyOutcome, recordOutcome as recordLadderOutcome, isLadderEligibleTF } from './ladder-engine.js';
+import { maybeDispatchSlAmend } from './sl-amend-trigger.js';
 import * as bridge from '../tv-bridge.js';
 import { acquireScanLock, releaseScanLock } from '../scanner-engine.js';
 import { resolveSymbol, inferCategory } from '../symbol-resolver.js';
@@ -121,19 +122,6 @@ export function evaluateSignalOutcome(signal, currentBar) {
       lastCheckedPrice: close,
       checkCount: (signal.checkCount || 0) + 1,
     };
-  }
-
-  // Sanity check: current price should be in the same ballpark as entry
-  if (signal.entry && close) {
-    const deviation = Math.abs(close - signal.entry) / signal.entry;
-    if (deviation > 0.10) {
-      // Price is 50%+ away from entry — likely wrong symbol/data
-      return {
-        lastCheckedAt: now,
-        checkCount: (signal.checkCount || 0) + 1,
-        warnings: [`Fiyat sapmasi cok yuksek: entry=${signal.entry}, current=${close}, sapma=%${(deviation * 100).toFixed(1)}`],
-      };
-    }
   }
 
   const updates = {
@@ -717,12 +705,18 @@ async function _checkAllOpenSignalsInner(signals) {
 
           const lastClose = bars[bars.length - 1].close;
 
-          // 2026-05-04: SUIUSDC tp3_hit hatasi sonrasi sıkılaştırıldı (50% → 10%).
-          // Ek olarak crypto sinyallerinde Binance live feed ile çapraz doğrulama:
-          // TV bar'ı Binance'den >%5 sapıyorsa kontamine veri, sinyali atla.
-          const priceDeviation = Math.abs(lastClose - sig.entry) / sig.entry;
+          // 2026-05-11: Kontaminasyon kontrolu entry yerine son dogrulanmis fiyata
+          // (lastCheckedPrice) gore yapilir. Karda 6+ gun tutulan pozisyon
+          // (EREGL +%12, INTC +%21, ASTOR +%15, ...) entry'den dogal olarak
+          // sapar; bu legit drift'i kontaminasyon olarak isaretlemek TP1
+          // hit'lerini kaciriyordu. Sudden tick-to-tick jump >%10 hala suphedir.
+          // Yeni sinyal icin lastCheckedPrice ~= entry, davranis ayni kalir.
+          const refPrice = (sig.lastCheckedPrice && Number.isFinite(sig.lastCheckedPrice) && sig.lastCheckedPrice > 0)
+            ? sig.lastCheckedPrice
+            : sig.entry;
+          const priceDeviation = Math.abs(lastClose - refPrice) / refPrice;
           if (priceDeviation > 0.10) {
-            console.log(`[Outcome] ${symbol}: fiyat sapmasi cok yuksek (entry=${sig.entry}, current=${lastClose}, sapma=%${(priceDeviation * 100).toFixed(1)}) — atlaniyor`);
+            console.log(`[Outcome] ${symbol}: ani fiyat sicramasi (ref=${refPrice}, current=${lastClose}, sapma=%${(priceDeviation * 100).toFixed(1)}) — atlaniyor`);
             errors++;
             continue;
           }
@@ -764,8 +758,11 @@ async function _checkAllOpenSignalsInner(signals) {
                 for (const m of oneBars) {
                   const updates = evaluateSignalOutcome(updated, m);
                   if (!updates) continue;
+                  const prev = updated;
                   const afterUpdate = updateSignal(updated.id, updates);
                   if (afterUpdate) {
+                    try { maybeDispatchSlAmend(prev, afterUpdate); }
+                    catch (e) { console.log(`[Outcome] sl-amend trigger hatası (${prev.id}): ${e.message}`); }
                     updated = afterUpdate;
                     anyUpdate = true;
                     if (isTerminal(afterUpdate.status, afterUpdate)) break;
@@ -791,8 +788,11 @@ async function _checkAllOpenSignalsInner(signals) {
             }
             const updates = evaluateSignalOutcome(updated, bar);
             if (!updates) continue;
+            const prev = updated;
             const afterUpdate = updateSignal(updated.id, updates);
             if (afterUpdate) {
+              try { maybeDispatchSlAmend(prev, afterUpdate); }
+              catch (e) { console.log(`[Outcome] sl-amend trigger hatası (${prev.id}): ${e.message}`); }
               updated = afterUpdate;
               anyUpdate = true;
               if (isTerminal(afterUpdate.status, afterUpdate)) break;

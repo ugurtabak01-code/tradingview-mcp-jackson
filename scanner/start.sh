@@ -50,10 +50,14 @@ echo ""
 # Kapatmak icin: OKX_EXECUTOR_ENABLED=0 ./start.sh
 export OKX_EXECUTOR_ENABLED="${OKX_EXECUTOR_ENABLED:-1}"
 export OKX_EXECUTOR_URL="${OKX_EXECUTOR_URL:-http://127.0.0.1:3939/api/signals/new}"
+# TP1 hit aninda native trailing-stop kurulumu icin executor'a discrete SL amend.
+# Kapatmak icin: OKX_SL_AMEND_ENABLED=0 ./start.sh
+export OKX_SL_AMEND_ENABLED="${OKX_SL_AMEND_ENABLED:-1}"
 
 echo "[3/3] Sunucu baslatiliyor..."
 echo "  Web UI: http://localhost:3838"
 echo "  OKX Executor webhook: ENABLED=$OKX_EXECUTOR_ENABLED → $OKX_EXECUTOR_URL"
+echo "  OKX SL amend (TP1 trail): ENABLED=$OKX_SL_AMEND_ENABLED"
 echo "  Durdurmak icin: Ctrl+C"
 echo ""
 
