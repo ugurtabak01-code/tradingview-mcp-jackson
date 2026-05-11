@@ -17,9 +17,12 @@
  */
 
 const CHART_URL = 'https://query1.finance.yahoo.com/v8/finance/chart/';
-const POLL_INTERVAL_MS = 5000; // 5 saniyede bir — Yahoo'ya nazik
+const POLL_INTERVAL_MS = 60_000;  // 60sn — Yahoo rate-limit (HTTP 429) almamak icin
 const REQUEST_TIMEOUT_MS = 4000;
 const BAR_RANGE_TOLERANCE = 0.02;
+const FETCH_BATCH_SIZE = 4;        // her batch'te paralel istek sayisi
+const BATCH_DELAY_MS = 800;        // batch'ler arasinda bekleme
+const BACKOFF_MAX_MS = 10 * 60_000; // 429 sonrasi en fazla 10dk geri cekil
 
 // BIST kategori prefix takilacak TV sembol seti (registerSymbolsByCategory ile doldurulur)
 const _bistSymbols = new Set();
@@ -51,10 +54,16 @@ let _stats = {
   lastPollAt: null,
   polls: 0,
   errors: 0,
+  rateLimitHits: 0,
+  lastRateLimitAt: null,
   symbolsTracked: 0,
   pricesResolved: 0,
 };
 let _stopped = false;
+let _backoffUntil = 0;       // ms epoch — bu ana kadar polling atlanir (429 sonrasi)
+let _last429LogAt = 0;
+let _consecutive429Polls = 0; // ardisik 429 yiyen poll sayisi (backoff'u bu artirir)
+let _pollHas429 = false;      // bu poll icinde en az bir 429 alindi mi
 
 /**
  * TV sembolunu Yahoo Finance sembolune cevir.
@@ -185,7 +194,14 @@ async function fetchOne(yahooSymbol) {
       signal: controller.signal,
     });
     clearTimeout(t);
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      if (resp.status === 429) {
+        _stats.rateLimitHits++;
+        _stats.lastRateLimitAt = Date.now();
+        _pollHas429 = true; // backoff genisletme pollOnce sonunda bir kerede yapilir
+      }
+      return null;
+    }
     const data = await resp.json();
     const result = data?.chart?.result?.[0];
     const meta = result?.meta;
@@ -247,14 +263,40 @@ export function isPlausibleYahooPrice(price, quote = {}, tolerance = BAR_RANGE_T
 }
 
 async function pollOnce() {
+  if (Date.now() < _backoffUntil) return; // 429 backoff aktif
   _stats.polls++;
   _stats.lastPollAt = Date.now();
+  _pollHas429 = false;
 
   const yahooSymbols = Array.from(_reverseMap.keys());
   if (yahooSymbols.length === 0) return;
 
-  // Paralel cek — 20 sembol ~1 saniye tamamlanir
-  const results = await Promise.all(yahooSymbols.map(s => fetchOne(s).then(r => [s, r])));
+  // Batch'li cek — Yahoo'yu rate-limit'e takmamak icin 4'erli paralel + 800ms ara
+  const results = [];
+  for (let i = 0; i < yahooSymbols.length; i += FETCH_BATCH_SIZE) {
+    if (_stopped) break;
+    if (_pollHas429) break; // bu poll'da 429 yedik, kalanini atla
+    const batch = yahooSymbols.slice(i, i + FETCH_BATCH_SIZE);
+    const batchResults = await Promise.all(batch.map(s => fetchOne(s).then(r => [s, r])));
+    results.push(...batchResults);
+    if (i + FETCH_BATCH_SIZE < yahooSymbols.length) {
+      await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+    }
+  }
+
+  // Bu poll'da 429 aldiysak: backoff'u tek seferde, ardisik poll sayisina gore artir.
+  if (_pollHas429) {
+    _consecutive429Polls++;
+    // 60s, 120s, 240s, 480s, 600s (cap)
+    const next = Math.min(BACKOFF_MAX_MS, 60_000 * Math.pow(2, _consecutive429Polls - 1));
+    _backoffUntil = Date.now() + next;
+    if (Date.now() - _last429LogAt > 30_000) {
+      _last429LogAt = Date.now();
+      console.log(`[YahooFeed] HTTP 429 (rate limit) — ${Math.round(next / 1000)}sn polling durduruldu (ardisik 429 poll: ${_consecutive429Polls})`);
+    }
+  } else {
+    _consecutive429Polls = 0; // saglikli poll: backoff sayacini sifirla
+  }
 
   const updates = [];
   for (const [yahooSymbol, r] of results) {
