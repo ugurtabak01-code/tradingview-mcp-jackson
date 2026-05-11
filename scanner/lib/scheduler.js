@@ -21,6 +21,7 @@ import { ensureConnection } from './tv-bridge.js';
 import { dispatchToOkxExecutor as dispatchToOkxExecutorShared } from './okx-dispatcher.js';
 import { isHalted, getHaltState } from './halt-state.js';
 import { isLive as isWrapperLive, getWrapperMode } from './learning/wrapper-mode.js';
+import { getEntrySnapshot as getLadderEntrySnapshot } from './learning/ladder-engine.js';
 import {
   ALL_CATEGORIES,
   openMarkets,
@@ -366,9 +367,41 @@ class ScanScheduler {
       }
 
       // OKX Executor: A/B otonom, C manuel onay. Sadece kripto kategorisi.
+      // Oncelik sirasiyla dispatch et — executor max/balance cap'lerine takilan
+      // sinyallerden kazanan en yuksek skorlu olur. Skor hierarchy:
+      //   1. Quality (A < B < C — daha kucuk = daha iyi)
+      //   2. Ladder windowWR DESC (yuksek WR onde)
+      //   3. tally.conviction DESC (oylama gucu)
+      //   4. tally.agreement DESC (oylama uyumu)
       const tradable = (result.signals || []).filter(s => ['A', 'B', 'C'].includes(s.grade));
-      for (const s of tradable) {
-        dispatchToOkxExecutor(s);
+      const QUALITY_RANK = { A: 0, B: 1, C: 2 };
+      const ranked = tradable.map(s => {
+        let wr = -1;
+        try {
+          const snap = getLadderEntrySnapshot(s.symbol, s.grade);
+          if (snap && Number.isFinite(snap.windowWR)) wr = snap.windowWR;
+        } catch {}
+        const t = (s.tally && typeof s.tally === 'object') ? s.tally : {};
+        return {
+          signal: s,
+          rank: QUALITY_RANK[s.grade] ?? 9,
+          wr,
+          conviction: Number.isFinite(t.conviction) ? t.conviction : -1,
+          agreement: Number.isFinite(t.agreement) ? t.agreement : -1,
+        };
+      }).sort((a, b) => {
+        if (a.rank !== b.rank) return a.rank - b.rank;             // A once
+        if (a.wr !== b.wr) return b.wr - a.wr;                     // yuksek WR onde
+        if (a.conviction !== b.conviction) return b.conviction - a.conviction;
+        if (a.agreement !== b.agreement) return b.agreement - a.agreement;
+        return 0;
+      });
+      if (ranked.length > 0) {
+        const order = ranked.map(r => `${r.signal.symbol}/${r.signal.grade}(WR=${r.wr},c=${r.conviction.toFixed(1)})`).join(', ');
+        console.log(`[scheduler] dispatch oncelik sirasi: ${order}`);
+      }
+      for (const r of ranked) {
+        dispatchToOkxExecutor(r.signal);
       }
     } catch (e) {
       this.broadcast({
