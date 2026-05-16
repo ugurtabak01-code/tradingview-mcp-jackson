@@ -31,6 +31,7 @@ import { categoryToMarketType as _shadowCategoryToMarketType } from './learning/
 // Risk #5 — Parser kirilma korumasi (sema validation + alarm counter)
 import { gateTechnicals, gateSMC } from './parser-validator.js';
 import { recordSignal } from './learning/signal-tracker.js';
+import { computeShadowFeatures } from './learning/shadow-features.js';
 import { loadWeights } from './learning/weight-adjuster.js';
 import { resolveSymbol, inferCategory } from './symbol-resolver.js';
 import fs from 'fs';
@@ -1002,6 +1003,14 @@ async function _scanShortTermInner(symbol, options = {}) {
       }
     }
   } catch { /* shadow path: never blocks live decision */ }
+
+  // Shadow features — orthogonal telemetry candidates. Computed AFTER the
+  // grader result + barrierSummary exist; read-only, no fetch, no shadow-
+  // primitive recomputation. NEVER read by grade/direction/tally/rr/entry/sl/
+  // tp/position_pct/league/wrapper/scheduler/OKX dispatch.
+  try {
+    bestSignal.shadowFeatures = computeShadowFeatures(bestSignal, { now: new Date() });
+  } catch { bestSignal.shadowFeatures = null; }
 
   // Record signal for learning (only non-IPTAL best signal)
   let transitionDirective = null;

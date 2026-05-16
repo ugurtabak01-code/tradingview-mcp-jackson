@@ -786,6 +786,11 @@ export function recordSignal(scanResult) {
     shadowVotes: Array.isArray(scanResult.shadowVotes) ? scanResult.shadowVotes : null,
     shadowMtfScore: scanResult.shadowMtfScore || scanResult.shadowMetrics?.mtfScore || null,
 
+    // Shadow features — orthogonal telemetry. Set once at creation; the
+    // same-direction upsert path leaves it untouched (preserved exactly as
+    // shadowMetrics is). No live decision path reads this field.
+    shadowFeatures: scanResult.shadowFeatures || null,
+
     // REGIME_GATES kalibrasyonu icin instrumentation (2026-05-12).
     // htfConfidence per-TF gradeShortTermSignal sonucundan; mtfAlignment
     // scanner-engine bestSignal'e tum TF'ler tamamlandiktan sonra yaziyor.
