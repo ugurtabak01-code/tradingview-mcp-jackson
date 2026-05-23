@@ -60,17 +60,23 @@ export function acquireScanLock(holder = 'unknown', timeoutMs = 0) {
     let timedOut = false;
     let timer = null;
 
-    const tryAcquire = () => {
-      if (timedOut) return; // Already timed out, don't acquire
-      if (!_scanActive) {
+    // forced=true: releaseScanLock'tan FIFO devir; _scanActive=true olsa bile al.
+    // Donus degeri: 'acquired' | 'timed_out' | 'queued'. Release path bu degeri
+    // okuyup transfer arasi timeout durumunda bir sonraki waiter'a kaydirir
+    // (aksi halde lock leak — _scanActive true kalir).
+    const tryAcquire = (forced = false) => {
+      if (timedOut) return 'timed_out';
+      if (forced || !_scanActive) {
         if (timer) clearTimeout(timer);
         _scanActive = true;
         _lockHolder = holder;
         console.log(`[Lock] Chart kilidi alindi: ${holder}`);
         resolve();
+        return 'acquired';
       } else {
         console.log(`[Lock] Chart mesgul (${_lockHolder}), kuyrukta bekliyor: ${holder}`);
         _lockQueue.push({ tryAcquire, reject });
+        return 'queued';
       }
     };
 
@@ -89,13 +95,39 @@ export function acquireScanLock(holder = 'unknown', timeoutMs = 0) {
 
 export function releaseScanLock() {
   const prev = _lockHolder;
-  _scanActive = false;
-  _lockHolder = null;
   console.log(`[Lock] Chart kilidi birakildi: ${prev || 'unknown'}`);
-  // Wake up next in queue
+  // FIFO devri: kuyrukta bekleyen varsa _scanActive'i true tutarak dogrudan
+  // o waiter'a aktariyoruz (atomik transfer). Aksi halde release ile yeni
+  // bekleyenin uyandirilmasi arasinda disaridan gelen senkron acquireScanLock
+  // cagrisi kuyruktan once kilidi kapip kuyrugun sirasini bozabilir
+  // (starvation / FIFO ihlali; eski 50ms setTimeout penceresi tehlikeliydi).
+  //
+  // Transfer arasi timeout fire ederse (waiter zaten reject olmus) sonraki
+  // waiter'a kaydir. Aksi halde kilit leak olur: _scanActive=true, holder yok.
+  const transferNext = () => {
+    while (_lockQueue.length > 0) {
+      const waiter = _lockQueue.shift();
+      _lockHolder = '<transferring>';
+      const status = (() => {
+        try { return waiter.tryAcquire(true); } catch (e) { console.warn(`[Lock] waiter tryAcquire hata: ${e?.message}`); return 'error'; }
+      })();
+      if (status === 'acquired') return true;
+      // timed_out veya error → bir sonraki waiter'i dene
+    }
+    return false;
+  };
+
   if (_lockQueue.length > 0) {
-    const waiter = _lockQueue.shift();
-    setTimeout(waiter.tryAcquire, 50);
+    _lockHolder = '<transferring>';
+    queueMicrotask(() => {
+      if (!transferNext()) {
+        _scanActive = false;
+        _lockHolder = null;
+      }
+    });
+  } else {
+    _scanActive = false;
+    _lockHolder = null;
   }
 }
 
