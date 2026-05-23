@@ -273,28 +273,91 @@ function confirmTFsForExec(execTF) {
 const LONG_TERM_TFS = ['1D', '3D', '1W', '1M'];
 const LONG_ENTRY_TF = '1D';
 
+// ---------------------------------------------------------------------------
+// Patch 4 — getAssetCategory: 3 kademeli kategorize
+// ---------------------------------------------------------------------------
+//
+// Eski davranis substring tabanli idi ve yanlis eslesmeler uretiyordu:
+//   - 'SOLAR'.includes('SOL') → kripto (yanlis; SOLAR hisse senedi)
+//   - 'PGSUS'.includes('PG')  → eskiden abd_hisse'ye dusuyordu (commit'te
+//     duzeltilmis, ama substring kalintilari hala var)
+//
+// Yeni davranis 3 kademe — exact match'i her zaman onceleyen:
+//   1. Watchlist EXACT match (rules.json) — bilinen sembol her seyden once.
+//   2. Index whitelist (USDT.D, BTC.D, DXY, VIX, US10Y, ...) — default.
+//   3. Suffix/prefix kural seti — Bilinen suffix'le bitiyorsa veya
+//      bilinen "named pair" pattern'i ise kategorize et:
+//        - .P / USDT / USDC suffix → kripto (perp/spot)
+//        - XAU/XAG/COPPER ile basliyor veya bitiyorsa → emtia
+//        - Bilinen 6-harf forex pair (EURUSD, GBPUSD, ...) → forex
+//   Hicbiri eslesmezse 'default'.
+//
+// assignAssetCategory saf fonksiyon (watchlist parametre); getAssetCategory
+// rules.json'dan cekip cagiriyor — boylece testler watchlist mock'lamadan
+// saf logic'i dogrulayabiliyor.
+
+const _INDEX_WHITELIST = new Set([
+  'USDT.D', 'BTC.D', 'ETH.D', 'OTHERS.D',
+  'DXY', 'VIX', 'US10Y', 'US02Y', 'US30Y',
+]);
+
+const _FOREX_PAIRS = new Set([
+  'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCHF', 'USDCAD',
+  'EURCHF', 'EURJPY', 'GBPJPY', 'NZDUSD', 'EURGBP',
+]);
+
+const _COMMODITY_TOKENS = new Set(['XAU', 'XAG', 'COPPER', 'WTI', 'BRENT']);
+
 /**
- * Determine asset category from symbol name.
+ * Saf kategorize fonksiyonu — watchlist parametre olarak alir. Test edilebilir.
+ * Donus: 'crypto' | 'emtia' | 'forex' | 'abd_hisse' | 'bist' | 'kripto' | 'default'
+ * (watchlist key'leri ne ise o; substring tahminden farkli olabilir).
  */
-function getAssetCategory(symbol) {
-  const s = symbol.toUpperCase();
-  // Strip exchange prefix
+export function assignAssetCategory(symbol, watchlist) {
+  if (!symbol) return 'default';
+  const s = String(symbol).toUpperCase();
   const bare = s.includes(':') ? s.split(':')[1] : s;
 
-  if (['XAUUSD', 'XAGUSD', 'COPPER'].some(c => bare.includes(c))) return 'emtia';
-  if (['EURUSD', 'EURCHF', 'GBPUSD', 'USDJPY', 'AUDUSD'].some(f => bare.includes(f))) return 'forex';
-  if (['BTC', 'ETH', 'XRP', 'SOL', 'SUI', 'LINK', 'HYPE', 'DOGE', 'ADA', 'AVAX', 'DOT', 'MON', 'PEPE', 'RENDER', 'USDT.D', 'BTC.D'].some(c => bare.includes(c))) return 'crypto';
-
-  // Check rules.json watchlist membership (exact match — substring match yanlis kategoriler
-  // veriyordu: 'PGSUS'.includes('PG') BIST tickerini 'abd_hisse'ye dusuruyordu).
-  try {
-    const rules = loadRules();
-    for (const [cat, syms] of Object.entries(rules.watchlist || {})) {
+  // 1. Watchlist exact match (her seyden once — kullanici tanimli)
+  if (watchlist && typeof watchlist === 'object') {
+    for (const [cat, syms] of Object.entries(watchlist)) {
+      if (!Array.isArray(syms)) continue;
       if (syms.some(ws => String(ws).toUpperCase() === bare)) return cat;
     }
-  } catch {}
+  }
 
+  // 2. Index whitelist (dominance / yield / vol index)
+  if (_INDEX_WHITELIST.has(bare)) return 'default';
+
+  // 3. Suffix/prefix kural seti
+  // 3a. Forex — exact 6-letter pair match (subset yok, sadece tam isim)
+  if (_FOREX_PAIRS.has(bare)) return 'forex';
+
+  // 3b. Kripto — perp/spot suffix kurallari
+  //   Perpetual: 'BTCUSDT.P', 'ETHUSDT.P', ...
+  //   Spot kripto: 'BTCUSDT', 'ETHUSDC', 'SOLUSDT', ... (USDT/USDC ile biten)
+  if (/\.P$/i.test(bare)) return 'crypto';
+  if (/(USDT|USDC|BUSD|DAI)$/i.test(bare)) return 'crypto';
+
+  // 3c. Emtia — XAU/XAG/COPPER ile baslayan veya biten (XAUUSD, USDXAU vs.)
+  for (const tok of _COMMODITY_TOKENS) {
+    if (bare.startsWith(tok) || bare.endsWith(tok)) return 'emtia';
+  }
+
+  // 4. Fallback
   return 'default';
+}
+
+/**
+ * Determine asset category from symbol name (watchlist'i rules.json'dan ceker).
+ */
+function getAssetCategory(symbol) {
+  try {
+    const rules = loadRules();
+    return assignAssetCategory(symbol, rules?.watchlist);
+  } catch {
+    return assignAssetCategory(symbol, null);
+  }
 }
 
 /**
@@ -337,8 +400,41 @@ function getTrendTFs(symbol) {
   return TREND_TFS[cat] || TREND_TFS.default;
 }
 
-function loadRules() {
-  return JSON.parse(fs.readFileSync(RULES_PATH, 'utf-8'));
+// ---------------------------------------------------------------------------
+// Patch 4 — loadRules() mtime cache
+// ---------------------------------------------------------------------------
+// rules.json scanner-engine icinde 5-10 kez/scan cagriliyor (getAssetCategory,
+// resolveChartSymbol, batchScan, vb.). Her cagri sync readFile + JSON.parse;
+// scan basina ~50-100μs israfi. mtime degismedikce parsed sonucu sakla.
+//
+// Guvenlik: rules.json sadece bu Node process'i tarafindan yaziliyor (server.js
+// writeRulesAtomic: tmp + rename). Multi-process yazim YOK → mtime invalidate
+// guvenli. External editor manuel duzenleyebilir; mtime check yine yakalar.
+let _rulesCache = null;
+let _rulesCacheMtimeMs = null;
+
+export function loadRules() {
+  try {
+    const st = fs.statSync(RULES_PATH);
+    if (_rulesCache && _rulesCacheMtimeMs === st.mtimeMs) {
+      return _rulesCache;
+    }
+    const parsed = JSON.parse(fs.readFileSync(RULES_PATH, 'utf-8'));
+    _rulesCache = parsed;
+    _rulesCacheMtimeMs = st.mtimeMs;
+    return parsed;
+  } catch (e) {
+    // Stat/read hatasi → cache atla, ham read'e dus (eski davranis).
+    return JSON.parse(fs.readFileSync(RULES_PATH, 'utf-8'));
+  }
+}
+
+/**
+ * Test/teshis amacli — cache'i sifirlamak gerekirse (orn. test izolasyonu).
+ */
+export function _resetRulesCache() {
+  _rulesCache = null;
+  _rulesCacheMtimeMs = null;
 }
 
 /**
