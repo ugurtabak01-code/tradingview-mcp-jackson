@@ -575,10 +575,14 @@ async function collectShortTermData(symbol, tf) {
   //   1. ensureChartReady: chart'i istenen sembol/TF'ye getir + pre-read verify
   //   2. gatherRawBundle: raw veri (quote + OHLCV + study + SMC) + post-read +
   //      deviation retry
-  //   3. enrichBundle: saf hesaplama (calculator + parser + shadow)
+  //   3. enrichBundle: saf hesaplama (calculator + parser + shadow). fibCache
+  //      buradan injection edilir (Patch 6.4) → enrichBundle disk I/O yapmaz.
   const ctx = await ensureChartReady(symbol, tf);
   const raw = await gatherRawBundle(symbol, tf, ctx);
-  return enrichBundle({ symbol, tf, ...raw });
+  let fibCache = null;
+  try { fibCache = loadFibCache(symbol); }
+  catch (e) { recordShadowDrop('fib', e?.message || 'load failed'); }
+  return enrichBundle({ symbol, tf, ...raw, fibCache });
 }
 
 /**
@@ -684,10 +688,15 @@ async function gatherRawBundle(symbol, tf, ctx) {
  *
  * Output: collectShortTermData'nin orijinal donus sekli.
  *
- * Async: _computeShadowPrimitives icindeki loadFibCache disk I/O yapiyor;
- * bu yuzden fonksiyon async (ama bridge cagrisi yok).
+ * Saf fonksiyon: bridge cagrisi YOK + disk I/O YOK. fibCache caller tarafindan
+ * injection olarak gelir; null verilirse fibCluster/goldenZone alanlari null
+ * kalir (mevcut "silent fib absent" davranisina denk).
+ *
+ * Async kalmis durumda cunku tarihsel _computeShadowPrimitives async idi;
+ * gelecekte tum bagimliliklar sync olursa sync'e cevrilebilir. Su an async
+ * sozlesmesi caller'larin await ile kullandigi icin korunuyor.
  */
-export async function enrichBundle({ symbol, tf, ohlcvData, studyValues, smc, quotePrice }) {
+export async function enrichBundle({ symbol, tf, ohlcvData, studyValues, smc, quotePrice, fibCache = null }) {
   const bars = ohlcvData?.bars || [];
   const smcSafe = smc || { labels: null, boxes: null, lines: null };
 
@@ -715,7 +724,7 @@ export async function enrichBundle({ symbol, tf, ohlcvData, studyValues, smc, qu
   // Patch 2 — shadow-only primitives. Hesaplanir ama tallyVotes'a gitmez;
   // gradeShortTermSignal bu alanlari result.shadowMetrics + result.shadowVotes
   // olarak surface eder. Hata/null durumunda alan sessizce eksik kalir.
-  const shadow = await _computeShadowPrimitives({ symbol, tf, bars, parsedKS, parsedSMC, parsedBoxes, quotePrice });
+  const shadow = await _computeShadowPrimitives({ symbol, tf, bars, parsedKS, parsedSMC, parsedBoxes, quotePrice, fibCache });
 
   return {
     tf,
@@ -743,7 +752,7 @@ export async function enrichBundle({ symbol, tf, ohlcvData, studyValues, smc, qu
 // Patch 2 helper — shadow primitives. Live decision path does NOT consume any
 // of these; gradeShortTermSignal only attaches them to the output.
 // ---------------------------------------------------------------------------
-async function _computeShadowPrimitives({ symbol, tf, bars, parsedKS, parsedSMC, parsedBoxes, quotePrice }) {
+async function _computeShadowPrimitives({ symbol, tf, bars, parsedKS, parsedSMC, parsedBoxes, quotePrice, fibCache = null }) {
   const out = {
     rsiSeries: null,
     cmf: null,
@@ -825,14 +834,15 @@ async function _computeShadowPrimitives({ symbol, tf, bars, parsedKS, parsedSMC,
     out.strongPivotBias  = deriveStrongPivotBias(parsedSMC.strongHigh, parsedSMC.strongLow);
   }
 
-  // Boroden — fib cluster + golden zone. Reads existing HTF cache only.
+  // Boroden — fib cluster + golden zone. Patch 6.4: fibCache caller'dan
+  // injection (saf fonksiyon — disk I/O burada DEGIL, collectShortTermData'da).
+  // Null gelirse alanlar null kalir (mevcut "silent fib absent" davranisi).
   try {
-    const fibCache = loadFibCache(symbol);
     if (fibCache) {
       out.fibCluster = findFibCluster(quotePrice, fibCache, 0.003);
       out.goldenZone = priceInGoldenZone(quotePrice, fibCache);
     }
-  } catch (e) { recordShadowDrop('fib', e?.message || 'cache absent'); }
+  } catch (e) { recordShadowDrop('fib', e?.message || 'cluster/zone error'); }
 
   // 200-bar fetch is intentionally NOT performed inside collectShortTermData
   // (the chart lock is held; an extra fetch would add latency to every TF).
