@@ -628,16 +628,40 @@ async function collectShortTermData(symbol, tf) {
     }
   }
 
+  // Patch 6 — Enrichment saf katmana (enrichBundle) tasindi: bridge cagrisi
+  // yapmaz; sadece raw veriyi (ohlcv/studyValues/smc/quotePrice) hesaplanmis
+  // alanlara cevirir. Bridge mock'suz unit testlenebilir.
+  return enrichBundle({ symbol, tf, ohlcvData, studyValues, smc, quotePrice });
+}
+
+/**
+ * Patch 6 — Enrichment katmani (saf, bridge bagimsiz).
+ *
+ * Inputs:
+ *   - symbol, tf (context)
+ *   - ohlcvData (raw OHLCV bundle from bridge)
+ *   - studyValues (raw study response)
+ *   - smc (raw SMC: { labels, boxes, lines })
+ *   - quotePrice (number)
+ *
+ * Output: collectShortTermData'nin orijinal donus sekli.
+ *
+ * Async: _computeShadowPrimitives icindeki loadFibCache disk I/O yapiyor;
+ * bu yuzden fonksiyon async (ama bridge cagrisi yok).
+ */
+export async function enrichBundle({ symbol, tf, ohlcvData, studyValues, smc, quotePrice }) {
   const bars = ohlcvData?.bars || [];
+  const smcSafe = smc || { labels: null, boxes: null, lines: null };
+
   // Risk #5 — Parser kirilma korumasi: parse sonrasi sema dogrulamasi.
   // 'broken' (>=50% required eksik) → null doner, mevcut akis BEKLE'ye duser.
   // 'partial' → veri gecer ama parser_alarm log dusturulur.
   const parsedKS = gateTechnicals(calcTechnicals(bars), { symbol, timeframe: tf });
-  const parsedSMC = gateSMC(parseSMCLabels(smc.labels), { symbol, timeframe: tf });
+  const parsedSMC = gateSMC(parseSMCLabels(smcSafe.labels), { symbol, timeframe: tf });
   // ATR-aware FVG/OB ayrimi icin atr ge geçir (parsedKS.atr veya KhanSaab study).
   const _atrForBoxes = parsedKS?.atr != null ? parsedKS.atr : parseFloat(extractATRFromStudy(studyValues));
-  const parsedBoxes = parseSMCBoxes(smc.boxes, { atr: isFinite(_atrForBoxes) ? _atrForBoxes : null });
-  const parsedSRLines = parseSMCLines(smc.lines);
+  const parsedBoxes = parseSMCBoxes(smcSafe.boxes, { atr: isFinite(_atrForBoxes) ? _atrForBoxes : null });
+  const parsedSRLines = parseSMCLines(smcSafe.lines);
 
   const formation = detectFormations(bars, { timeframe: tf });
   const volConfirm = checkVolumeConfirmation(bars);
@@ -661,7 +685,7 @@ async function collectShortTermData(symbol, tf) {
     studyValues,
     khanSaab: parsedKS,
     smc: parsedSMC,
-    rawSMC: smc,
+    rawSMC: smcSafe,
     parsedBoxes,
     smcSRLines: parsedSRLines,
     khanSaabLabels: null,
