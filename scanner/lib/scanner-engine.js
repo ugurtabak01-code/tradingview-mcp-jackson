@@ -495,10 +495,20 @@ function tfLabel(tf) {
 }
 
 /**
- * Scan a single timeframe for short-term data (KhanSaab + SMC).
- * Returns raw collected data for that TF.
+ * Patch 6 — adım 2: Chart hazırlık katmanı.
+ *
+ * Sorumluluk: chart'i istenen sembol + TF'ye getir, bar verisinin gerçekten
+ * yenilendiğini doğrula, ve veri okumadan ÖNCE sembolün doğru olduğunu
+ * kontrol et. Hata varsa ScanError throw eder (factory'lerden).
+ *
+ * Side effect: chart state (TradingView Desktop) değişir. Bridge çağrıları
+ * içerir; saf değildir, mock'suz test edilemez. Davranışı mevcut 229
+ * regression test'i kanıtlar (refactor öncesi/sonrası).
+ *
+ * Dönüş: { chartSymbol, bareExpected } — sonraki katmanların ihtiyacı
+ * olan context.
  */
-async function collectShortTermData(symbol, tf) {
+async function ensureChartReady(symbol, tf) {
   const bareSymbol = symbol.includes(':') ? symbol.split(':')[1] : symbol;
   const chartSymbol = resolveChartSymbol(symbol);
 
@@ -552,6 +562,19 @@ async function collectShortTermData(symbol, tf) {
       throw chartSymbolMismatch(symbol, tf, recheckRes.reason);
     }
   }
+
+  return { chartSymbol, bareExpected };
+}
+
+/**
+ * Scan a single timeframe for short-term data (KhanSaab + SMC).
+ * Returns raw collected data for that TF.
+ */
+async function collectShortTermData(symbol, tf) {
+  // Patch 6 — adım 2: chart hazırlık katmanı (ensureChartReady) çıkarıldı.
+  // Sembol + TF setle → bar data değişimi bekle → pre-read bare verify.
+  // Sonraki katman (gatherRawBundle) bareExpected + chartSymbol ile çalışır.
+  const { chartSymbol, bareExpected } = await ensureChartReady(symbol, tf);
 
   // Get quote price first for validation (independent of TF) — guard with expectedSymbol
   const quotePrice = await bridge.getQuote(chartSymbol).then(q => (q && !q._symbolMismatch ? q.close : null)).catch(() => null);
