@@ -12,7 +12,24 @@
  *   4. VWAP is key magnet/S&R for liquid instruments
  */
 
-import * as bridge from './tv-bridge.js';
+import * as _rawBridge from './tv-bridge.js';
+import { withCdpTimeout, BRIDGE_TIMEOUTS } from './bridge-timeout.js';
+
+// Patch 2 — CDP timeout proxy. Sadece BRIDGE_TIMEOUTS'ta listelenen op'lar
+// sarmalanir (setSymbol, setTimeframe, getOhlcv*, getStudyValues, getQuote,
+// getCurrentBareSymbol, getChartState, readSMC). waitForDataChange ve
+// getBarSnapshot pass-through kalir (kendi timeout/anlik state mantiklari var).
+// 28 call-site'i tek tek sarmamak yerine Proxy ile tum bridge.X(...) cagrilari
+// otomatik timeout-korumali hale gelir; CDP donarsa CdpTimeoutError throw eder
+// ve TF HATA grade'iyle duser, scan finally bloku chart-mutex'i serbest birakir.
+const _WRAPPED_OPS = new Set(Object.keys(BRIDGE_TIMEOUTS).filter(k => k !== 'default'));
+const bridge = new Proxy(_rawBridge, {
+  get(target, prop) {
+    const fn = target[prop];
+    if (typeof fn !== 'function' || !_WRAPPED_OPS.has(prop)) return fn;
+    return (...args) => withCdpTimeout(fn.apply(target, args), prop);
+  },
+});
 import { detectFormations, checkVolumeConfirmation } from './formation-detector.js';
 import { calculateTrendlines } from './trendline-engine.js';
 import { detectRSIDivergence, detectSqueeze, analyzeCDV, parseSMCLabels, getVolatilityRegime, calculateStochRSI, getCategorySLBoost, parseSMCBoxes, parseSMCLines, calcTechnicals,
