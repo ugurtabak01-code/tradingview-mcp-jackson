@@ -18,3 +18,8 @@ scanner/data/
 .env.*
 *.key
 *.pem
+
+# Test coverage output (Konu 4) — npm run test:coverage:lcov uretir
+scanner/coverage/
+coverage/
+*.lcov

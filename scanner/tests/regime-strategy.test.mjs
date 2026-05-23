@@ -7,32 +7,58 @@
  *   - chaos/drift/closed: anında red
  *   - BIST decoupled_stress: long red, short serbest (gate'e tabi)
  *   - SL multiplier rejim profilinden
- *   - Shadow mode: wouldDispatch bayrağı doğru, dispatch=false
+ *   - Wrapper mode: default live, shadow geçersiz, dispatch shadow yüzünden kesilmez
+ *   - İlk 5 gün real lig executor'a ara lig gibi gönderilir
  */
 
 import { test, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// cwd-bağımsız resolve — npm test (cwd=scanner/) ile node --test (cwd=repo
+// root) arasında aynı çalışsın (önce ./scanner/data relative path'i flaky'di).
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = path.resolve(__dirname, '../data');
 import {
   applyRegimeStrategy,
   suppressVotes,
   checkGates,
   __internals,
 } from '../lib/learning/regime-strategy.js';
-import { _resetWrapperMode, setWrapperMode } from '../lib/learning/wrapper-mode.js';
+import {
+  _resetWrapperMode,
+  setWrapperMode,
+  getWrapperMode,
+  routeLeagueForExecutor,
+  __internals as wrapperModeInternals,
+} from '../lib/learning/wrapper-mode.js';
 import { REGIME_GATES } from '../lib/learning/regime-profiles.js';
 
-// Test başında shadow mode default
+const wrapperModeStateBackup = fs.existsSync(wrapperModeInternals.STATE_PATH)
+  ? fs.readFileSync(wrapperModeInternals.STATE_PATH, 'utf8')
+  : null;
+
+// Test başında live mode default
 beforeEach(() => {
   _resetWrapperMode();
 });
 
-// Test sonrası test log'larını temizle
+// Test sonrası test log'larını temizle ve canlı wrapper mode dosyasını geri koy.
 after(() => {
-  const dir = './scanner/data';
-  if (!fs.existsSync(dir)) return;
-  for (const f of fs.readdirSync(dir).filter(x => x.startsWith('wrapper-decisions-'))) {
-    try { fs.unlinkSync(`${dir}/${f}`); } catch {}
+  if (fs.existsSync(DATA_DIR)) {
+    for (const f of fs.readdirSync(DATA_DIR).filter(x => x.startsWith('wrapper-decisions-'))) {
+      try { fs.unlinkSync(path.join(DATA_DIR, f)); } catch {}
+    }
+  }
+  if (wrapperModeStateBackup === null) {
+    try { fs.unlinkSync(wrapperModeInternals.STATE_PATH); } catch {}
+  } else {
+    try {
+      fs.mkdirSync(path.dirname(wrapperModeInternals.STATE_PATH), { recursive: true });
+      fs.writeFileSync(wrapperModeInternals.STATE_PATH, wrapperModeStateBackup);
+    } catch {}
   }
 });
 
@@ -139,8 +165,8 @@ test('10. applyRegimeStrategy ranging C grade → PASS, momentum bastırıldı',
   assert.equal(out.slMultiplier, 1.5);
   assert.equal(out.tpProfile, 'tight');
   assert.ok(out.boostedVotes.includes('rsi_level'));
-  assert.equal(out.shadowMode, true);
-  assert.equal(out.wouldDispatch, true);  // gate pass ama shadow → dispatch yok
+  assert.equal(out.shadowMode, false);
+  assert.equal(out.wouldDispatch, true);
 });
 
 test('11. applyRegimeStrategy chaos → REJECT', () => {
@@ -176,7 +202,9 @@ test('13. applyRegimeStrategy bist_decoupled_stress + long allowed → REJECT_BI
   assert.equal(out.decision, 'REJECT_BIST_LONG');
 });
 
-test('14. applyRegimeStrategy live mode → wouldDispatch geçer, shadowMode=false', () => {
+test('14. wrapper mode default live → wouldDispatch geçer, shadowMode=false', () => {
+  const state = getWrapperMode();
+  assert.equal(state.mode, 'live');
   setWrapperMode({ mode: 'live', by: 'unit_test' });
   const out = applyRegimeStrategy({
     regimeContext: { regime: 'trending_up', newPositionAllowed: true },
@@ -186,6 +214,29 @@ test('14. applyRegimeStrategy live mode → wouldDispatch geçer, shadowMode=fal
   });
   assert.equal(out.shadowMode, false);
   assert.equal(out.wouldDispatch, true);
+});
+
+test('14b. shadow geçerli wrapper modu değildir', () => {
+  assert.throws(
+    () => setWrapperMode({ mode: 'shadow', by: 'unit_test' }),
+    /invalid mode: shadow/,
+  );
+});
+
+test('14c. real lig ilk 5 gün executor onayı için ara lige yönlenir', () => {
+  const state = getWrapperMode();
+  const insideWindow = new Date(Date.parse(state.realLeagueApprovalOnlyUntil) - 1000);
+  const afterWindow = new Date(Date.parse(state.realLeagueApprovalOnlyUntil) + 1000);
+
+  const routed = routeLeagueForExecutor('real', { now: insideWindow });
+  assert.equal(routed.league, 'ara');
+  assert.equal(routed.originalLeague, 'real');
+  assert.equal(routed.approvalOnlyActive, true);
+
+  const normal = routeLeagueForExecutor('real', { now: afterWindow });
+  assert.equal(normal.league, 'real');
+  assert.equal(normal.originalLeague, 'real');
+  assert.equal(normal.approvalOnlyActive, false);
 });
 
 test('15a. signal-grader gerçek source key uyumu (vote.source)', () => {
@@ -239,9 +290,9 @@ test('15. JSONL log üretildi mi?', () => {
     htfConfidence: 50, mtfAlignment: 65,
   });
   const today = new Date().toISOString().slice(0, 10);
-  const path = `./scanner/data/wrapper-decisions-${today}.jsonl`;
-  assert.ok(fs.existsSync(path), 'log dosyası yok');
-  const lines = fs.readFileSync(path, 'utf8').trim().split('\n');
+  const logPath = path.join(DATA_DIR, `wrapper-decisions-${today}.jsonl`);
+  assert.ok(fs.existsSync(logPath), 'log dosyası yok');
+  const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n');
   const last = JSON.parse(lines[lines.length - 1]);
   assert.equal(last.symbol, 'TESTSYM');
   assert.equal(last.regime, 'ranging');
