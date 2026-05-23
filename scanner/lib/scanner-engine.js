@@ -13,7 +13,8 @@
  */
 
 import * as _rawBridge from './tv-bridge.js';
-import { withCdpTimeout, BRIDGE_TIMEOUTS } from './bridge-timeout.js';
+import { withCdpTimeout, BRIDGE_TIMEOUTS, shouldReconnect, clearReconnectFlag } from './bridge-timeout.js';
+import { disconnect as _cdpDisconnect } from './cdp-connection.js';
 
 // Patch 2 — CDP timeout proxy. Sadece BRIDGE_TIMEOUTS'ta listelenen op'lar
 // sarmalanir (setSymbol, setTimeframe, getOhlcv*, getStudyValues, getQuote,
@@ -164,6 +165,47 @@ export function drainLockQueue() {
     console.log(`[Lock] Kuyruk temizlendi: ${drained} bekleyen istek iptal/reject edildi`);
   }
   return drained;
+}
+
+/**
+ * Patch 3b — Scan lifecycle helper.
+ *
+ * Üç top-level scan entry point'i (scanShortTerm/scanLongTerm/batchScan) aynı
+ * pattern'i tekrarliyor:
+ *   await acquireScanLock(holder);
+ *   try { return await innerFn() } finally { releaseScanLock() }
+ *
+ * Patch 3b iki yenilik ekliyor:
+ *   1. Lock acquire'a timeout (default 5 dk, SCAN_LOCK_TIMEOUT_MS env override) —
+ *      CDP donmus bir holder lock'u suresiz tutmasin. Mevcut acquireScanLock
+ *      timeoutMs param'i zaten destekliyor; burada uygulaniyor.
+ *   2. finally release SONRASI shouldReconnect() true ise async disconnect()
+ *      tetiklenir. Sonraki getClient cagrisi otomatik yeni baglanti kurar
+ *      (cdp-connection.js reconnect mantigi mevcut). Reconnect mutex DISINDA
+ *      cunku release zaten yapilmis — yeni scan beklerken arka planda yenileniyor.
+ *
+ * Bu helper DRY icin; mantik scanShortTerm/Long/batch arasinda tek tek
+ * tekrarlanmasin diye.
+ */
+const SCAN_LOCK_TIMEOUT_MS = parseInt(process.env.SCAN_LOCK_TIMEOUT_MS, 10) > 0
+  ? parseInt(process.env.SCAN_LOCK_TIMEOUT_MS, 10)
+  : 300000; // 5 dk
+
+async function withScanLifecycle(holder, fn) {
+  await acquireScanLock(holder, SCAN_LOCK_TIMEOUT_MS);
+  try {
+    return await fn();
+  } finally {
+    releaseScanLock();
+    // Release SONRASI reconnect kontrolu — mutex DIŞINDA fire-and-forget.
+    // Bir sonraki getClient zaten reconnect yapacak; biz sadece eski
+    // baglantiyi proaktif kapatip yeni client'a temiz baslangic veriyoruz.
+    if (shouldReconnect()) {
+      clearReconnectFlag();
+      console.warn('[CDP] Reconnect tetikleniyor (ardisik timeout esigi asildi)');
+      _cdpDisconnect().catch(err => console.warn(`[CDP] disconnect hata: ${err?.message}`));
+    }
+  }
 }
 const RULES_PATH = path.resolve(__dirname, '../../rules.json');
 
@@ -786,12 +828,7 @@ async function quickTrendCheck(symbol, tf) {
  *   Phase 3: Grade each TF, apply trend filter, pick best signal
  */
 export async function scanShortTerm(symbol, options = {}) {
-  await acquireScanLock(`short:${symbol}`);
-  try {
-    return await _scanShortTermInner(symbol, options);
-  } finally {
-    releaseScanLock();
-  }
+  return withScanLifecycle(`short:${symbol}`, () => _scanShortTermInner(symbol, options));
 }
 
 async function _scanShortTermInner(symbol, options = {}) {
@@ -1366,12 +1403,7 @@ export { getSignalHistory } from './learning/signal-tracker.js';
  * Scans 4H, 1D, 3D, 1W, 1M with Supertrend + IFCCI.
  */
 export async function scanLongTerm(symbol, options = {}) {
-  await acquireScanLock(`long:${symbol}`);
-  try {
-    return await _scanLongTermInner(symbol, options);
-  } finally {
-    releaseScanLock();
-  }
+  return withScanLifecycle(`long:${symbol}`, () => _scanLongTermInner(symbol, options));
 }
 
 async function _scanLongTermInner(symbol, options = {}) {
@@ -1486,12 +1518,7 @@ export function markSymbolScheduled(symbol) {
 }
 
 export async function batchScan(category, mode = 'short', options = {}) {
-  await acquireScanLock(`batch:${category}:${mode}`);
-  try {
-    return await _batchScanInner(category, mode, options);
-  } finally {
-    releaseScanLock();
-  }
+  return withScanLifecycle(`batch:${category}:${mode}`, () => _batchScanInner(category, mode, options));
 }
 
 async function _batchScanInner(category, mode = 'short', options = {}) {

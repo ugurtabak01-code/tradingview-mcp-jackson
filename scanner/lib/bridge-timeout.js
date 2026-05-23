@@ -85,9 +85,10 @@ export function withCdpTimeout(promise, op) {
   });
   // Promise.race: hangisi once dondurursa o kazanir. Timer'i temizle ki
   // GC ve test sonrasi pending handle uyarisi olmasin.
-  return Promise.race([promise, timeoutPromise]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
+  return Promise.race([promise, timeoutPromise])
+    .then(result => { recordCdpSuccess(); return result; })
+    .catch(err => { if (isCdpTimeoutError(err)) recordCdpTimeout(); throw err; })
+    .finally(() => { if (timer) clearTimeout(timer); });
 }
 
 /**
@@ -95,4 +96,67 @@ export function withCdpTimeout(promise, op) {
  */
 export function isCdpTimeoutError(err) {
   return Boolean(err && err.code === 'CDP_TIMEOUT');
+}
+
+// ---------------------------------------------------------------------------
+// Patch 3b — Consecutive timeout sayaci + reconnect bayragi
+// ---------------------------------------------------------------------------
+//
+// CDP gercek bir cancel mekanizmasi sunmuyor (bkz. docs/cdp-cancel-feasibility.md);
+// asili kalan setSymbol/setTimeframe gibi cagrilar arka planda devam edebilir.
+// Ardisik N=3 timeout = gercek hung (tek timeout muhtemelen gecici hickirik).
+// Bu durumda reconnect bayragi set edilir; bir sonraki getClient cagrisi
+// otomatik olarak yeni bir CDP baglantisi kurar (cdp-connection.js zaten
+// chart-API check ile reconnect mantigini desteklyor).
+//
+// Onemli: bu modul disconnect()/connect()'i CAGIRMAZ — sadece bayragi
+// set eder. Actual reconnect cdp-connection.js'in getClient mantigi
+// tarafindan yapilir. Boylece chart-mutex tutarken reconnect tetiklenmez;
+// finally bloku release ettikten sonra bir sonraki scan reconnect'i tetikler.
+//
+// recordCdpSuccess / recordCdpTimeout / shouldReconnect saf fonksiyonlar
+// (disk/network bagimsiz) → test-edilebilir.
+
+const RECONNECT_THRESHOLD = parseInt(process.env.CDP_RECONNECT_THRESHOLD, 10) > 0
+  ? parseInt(process.env.CDP_RECONNECT_THRESHOLD, 10)
+  : 3;
+
+let _consecutiveTimeouts = 0;
+let _needsReconnect = false;
+
+export function recordCdpSuccess() {
+  if (_consecutiveTimeouts > 0) {
+    console.log(`[CDP] Sayac sifirlandi (basarili call); onceki ardisik timeout: ${_consecutiveTimeouts}`);
+  }
+  _consecutiveTimeouts = 0;
+}
+
+export function recordCdpTimeout() {
+  _consecutiveTimeouts += 1;
+  console.warn(`[CDP] Timeout sayaci: ${_consecutiveTimeouts}/${RECONNECT_THRESHOLD}`);
+  if (_consecutiveTimeouts >= RECONNECT_THRESHOLD) {
+    _needsReconnect = true;
+    console.warn(`[CDP] ${RECONNECT_THRESHOLD} ardisik timeout — reconnect bayragi set edildi`);
+  }
+}
+
+export function shouldReconnect() {
+  return _needsReconnect;
+}
+
+export function clearReconnectFlag() {
+  _needsReconnect = false;
+  _consecutiveTimeouts = 0;
+}
+
+/**
+ * Test/teshis amacli iç state'i okuma — public API'nin parcasi degil,
+ * sadece testler ve admin endpoint'leri icin.
+ */
+export function _getCdpCounterState() {
+  return {
+    consecutiveTimeouts: _consecutiveTimeouts,
+    needsReconnect: _needsReconnect,
+    threshold: RECONNECT_THRESHOLD,
+  };
 }

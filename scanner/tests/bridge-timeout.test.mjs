@@ -15,6 +15,11 @@ import {
   CdpTimeoutError,
   withCdpTimeout,
   isCdpTimeoutError,
+  recordCdpSuccess,
+  recordCdpTimeout,
+  shouldReconnect,
+  clearReconnectFlag,
+  _getCdpCounterState,
 } from '../lib/bridge-timeout.js';
 
 // Yardımcılar
@@ -195,4 +200,91 @@ test('withCdpTimeout: scan finally pattern → mutex serbest', async () => {
   } finally {
     BRIDGE_TIMEOUTS.getCurrentBareSymbol = originalBare;
   }
+});
+
+// ---------------------------------------------------------------------------
+// Patch 3b — Consecutive timeout sayacı + reconnect bayrağı
+// ---------------------------------------------------------------------------
+
+test('Patch 3b: recordCdpSuccess sayacı sıfırlar', () => {
+  clearReconnectFlag();
+  recordCdpTimeout(); recordCdpTimeout();
+  assert.equal(_getCdpCounterState().consecutiveTimeouts, 2);
+  recordCdpSuccess();
+  assert.equal(_getCdpCounterState().consecutiveTimeouts, 0);
+  assert.equal(_getCdpCounterState().needsReconnect, false);
+});
+
+test('Patch 3b: recordCdpTimeout sayacı artırır', () => {
+  clearReconnectFlag();
+  recordCdpTimeout();
+  assert.equal(_getCdpCounterState().consecutiveTimeouts, 1);
+  recordCdpTimeout();
+  assert.equal(_getCdpCounterState().consecutiveTimeouts, 2);
+});
+
+test('Patch 3b: N=3 eşiğinde reconnect bayrağı set edilir', () => {
+  clearReconnectFlag();
+  assert.equal(shouldReconnect(), false);
+  recordCdpTimeout();
+  recordCdpTimeout();
+  assert.equal(shouldReconnect(), false, '2. timeout reconnect tetiklememeli');
+  recordCdpTimeout();
+  assert.equal(shouldReconnect(), true, '3. timeout reconnect tetiklemeli');
+});
+
+test('Patch 3b: clearReconnectFlag hem bayrağı hem sayacı sıfırlar', () => {
+  clearReconnectFlag();
+  recordCdpTimeout(); recordCdpTimeout(); recordCdpTimeout();
+  assert.equal(shouldReconnect(), true);
+  clearReconnectFlag();
+  assert.equal(shouldReconnect(), false);
+  assert.equal(_getCdpCounterState().consecutiveTimeouts, 0);
+});
+
+test('Patch 3b: araya giren başarı reconnect tetiklemeyi engeller', () => {
+  // Tek tek hıçkırık → ardışık değil. 2 timeout + 1 başarı + 2 timeout reconnect ETMEMELI.
+  clearReconnectFlag();
+  recordCdpTimeout(); recordCdpTimeout();
+  recordCdpSuccess(); // ardışıklık kırıldı
+  recordCdpTimeout(); recordCdpTimeout();
+  assert.equal(shouldReconnect(), false, 'aradaki basari sayaci sifirlamali');
+  assert.equal(_getCdpCounterState().consecutiveTimeouts, 2);
+});
+
+test('Patch 3b: withCdpTimeout başarısı sayacı otomatik sıfırlar', async () => {
+  clearReconnectFlag();
+  recordCdpTimeout(); recordCdpTimeout();
+  assert.equal(_getCdpCounterState().consecutiveTimeouts, 2);
+  // delay 10ms başarılı — withCdpTimeout sayacı sıfırlamalı
+  await withCdpTimeout(new Promise(r => setTimeout(() => r('ok'), 10)), 'getCurrentBareSymbol');
+  assert.equal(_getCdpCounterState().consecutiveTimeouts, 0);
+});
+
+test('Patch 3b: withCdpTimeout timeout sayacı otomatik artırır', async () => {
+  clearReconnectFlag();
+  const originalBare = BRIDGE_TIMEOUTS.getCurrentBareSymbol;
+  BRIDGE_TIMEOUTS.getCurrentBareSymbol = 50;
+  try {
+    try {
+      await withCdpTimeout(new Promise(() => {}), 'getCurrentBareSymbol');
+    } catch (e) { /* expected */ }
+    assert.equal(_getCdpCounterState().consecutiveTimeouts, 1);
+    try {
+      await withCdpTimeout(new Promise(() => {}), 'getCurrentBareSymbol');
+    } catch (e) { /* expected */ }
+    assert.equal(_getCdpCounterState().consecutiveTimeouts, 2);
+  } finally {
+    BRIDGE_TIMEOUTS.getCurrentBareSymbol = originalBare;
+    clearReconnectFlag();
+  }
+});
+
+test('Patch 3b: CDP timeout DIŞINDA hata sayacı artırmaz', async () => {
+  // Custom error (timeout değil) → recordCdpTimeout çağrılmamalı.
+  clearReconnectFlag();
+  try {
+    await withCdpTimeout(Promise.reject(new Error('not a timeout')), 'getCurrentBareSymbol');
+  } catch (e) { /* expected */ }
+  assert.equal(_getCdpCounterState().consecutiveTimeouts, 0, 'non-timeout hata sayaci artirmamali');
 });
