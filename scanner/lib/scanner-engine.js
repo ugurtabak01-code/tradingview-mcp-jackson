@@ -14,13 +14,14 @@
 
 import * as bridge from './tv-bridge.js';
 import { detectFormations, checkVolumeConfirmation } from './formation-detector.js';
+import { calculateTrendlines } from './trendline-engine.js';
 import { detectRSIDivergence, detectSqueeze, analyzeCDV, parseSMCLabels, getVolatilityRegime, calculateStochRSI, getCategorySLBoost, parseSMCBoxes, parseSMCLines, calcTechnicals,
   // Patch 2 — shadow primitives (Lloyd 2013, Swanson 2014, King 2022, Boroden 2008)
   calcCMF, calcMFI, calcMAStack, calcMACross, calcMACDExtended,
   detectRsiThresholdCross, detectRsiFailureSwing, tagMitigation, classifyCleanBreak,
   deriveLiquidityBias, deriveStrongPivotBias, findFibCluster, priceInGoldenZone,
   computeMtfScore } from './calculators.js';
-import { loadFibCache } from './fib-engine.js';
+import { loadFibCache, checkFibCacheAge, refreshHTFFibForSymbol } from './fib-engine.js';
 import { gradeShortTermSignal, gradeLongTermSignal } from './signal-grader.js';
 import { getMacroState, applyMacroFilter, formatMacroSummary } from './macro-filter.js';
 import { classifyRegime } from './learning/regime-detector.js';
@@ -31,6 +32,8 @@ import { categoryToMarketType as _shadowCategoryToMarketType } from './learning/
 // Risk #5 — Parser kirilma korumasi (sema validation + alarm counter)
 import { gateTechnicals, gateSMC } from './parser-validator.js';
 import { recordSignal } from './learning/signal-tracker.js';
+import { buildDecisionSnapshot, recordDecisionSnapshot } from './learning/decision-snapshot-recorder.js';
+import { buildFundamentalSnapshot } from './fundamental/index.js';
 import { computeShadowFeatures } from './learning/shadow-features.js';
 import { loadWeights } from './learning/weight-adjuster.js';
 import { resolveSymbol, inferCategory } from './symbol-resolver.js';
@@ -100,8 +103,7 @@ export function releaseScanLock() {
   // o waiter'a aktariyoruz (atomik transfer). Aksi halde release ile yeni
   // bekleyenin uyandirilmasi arasinda disaridan gelen senkron acquireScanLock
   // cagrisi kuyruktan once kilidi kapip kuyrugun sirasini bozabilir
-  // (starvation / FIFO ihlali; eski 50ms setTimeout penceresi tehlikeliydi).
-  //
+  // (starvation / FIFO ihlali).
   // Transfer arasi timeout fire ederse (waiter zaten reject olmus) sonraki
   // waiter'a kaydir. Aksi halde kilit leak olur: _scanActive=true, holder yok.
   const transferNext = () => {
@@ -118,13 +120,13 @@ export function releaseScanLock() {
   };
 
   if (_lockQueue.length > 0) {
-    _lockHolder = '<transferring>';
     queueMicrotask(() => {
       if (!transferNext()) {
         _scanActive = false;
         _lockHolder = null;
       }
     });
+    _lockHolder = '<transferring>';
   } else {
     _scanActive = false;
     _lockHolder = null;
@@ -280,6 +282,49 @@ function loadRules() {
   return JSON.parse(fs.readFileSync(RULES_PATH, 'utf-8'));
 }
 
+/**
+ * Chart'ta okunan bare-symbol (`bridge.getCurrentBareSymbol()` ciktisi) bekleneni
+ * tutuyor mu? FAIL-CLOSED: actual null/undefined/bos string ise BASARISIZ kabul
+ * edilir (eski `if (actual && actual !== expected)` davranisi bridge state'i
+ * okuyamadiginda guard'i ATLIYORDU — sembol switch sirasinda CDP donarsa stale
+ * sembolden gelen barlar 'dogrulanmis' sayilabilirdi).
+ *
+ * Dönüş: { ok, reason }
+ *   ok=true: actual === expected (uppercase exact match)
+ *   ok=false: actual null/undefined/'' VEYA actual !== expected; reason aciklayicidir
+ *
+ * Helper export edilir ki scanner-engine'in dis kullanicilari da ayni dogrulama
+ * tutarsiziligini tekrar etmesin; testler bu helper'i dogrudan calistirabilsin.
+ */
+export function assertBareSymbolMatch(actual, expected) {
+  if (expected == null || expected === '') {
+    return { ok: false, reason: 'expected bare-symbol bos' };
+  }
+  if (actual == null || actual === '') {
+    return { ok: false, reason: 'bridge sembol durumu okunamadi (null) — fail-closed' };
+  }
+  const a = String(actual).toUpperCase();
+  const e = String(expected).toUpperCase();
+  if (a !== e) {
+    return { ok: false, reason: `chart sembolu uyumsuz: ${a} vs ${e}` };
+  }
+  return { ok: true, reason: null };
+}
+
+/**
+ * Deviation retry sonrasi OHLCV swap'i. Eski davranis sadece `bars` ve
+ * `total_bars` alanlarini mutate ediyordu; geri kalan alanlar (`stale`,
+ * `lastBarAge`, `lastBarTimestamp`, `symbolMismatch`, ...) orijinal degerinde
+ * kaliyor ve downstream learning/grader yanilticisi olabiliyordu.
+ *
+ * Yeni davranis: retry sonucunun tum alanlarini orijinalin uzerine yaz (immutable
+ * spread). Mutation yok — caller yeni objeyi atayarak kullanir.
+ */
+export function mergeDeviationRetry(orig, retry) {
+  if (!retry || !Array.isArray(retry.bars) || retry.bars.length === 0) return orig;
+  return { ...(orig || {}), ...retry };
+}
+
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
@@ -306,25 +351,45 @@ async function collectShortTermData(symbol, tf) {
   }
   await bridge.setTimeframe(tf);
 
-  // DATA-LEVEL wait: wait for bars collection to actually change (replaces fixed sleep(3000))
-  const dataChangeResult = await bridge.waitForDataChange(prevSnapshot, 10000);
+  // DATA-LEVEL wait: bars collection MUST actually change after the symbol switch.
+  //
+  // Bug 2026-05-23: TradingView `chart.symbol()` istenen sembolu setSymbol cagrisi
+  // ile aninda dondurur — fakat mainSeries().bars() koleksiyonu yeni sembolun
+  // barlarini henuz yuklemiyor olabilir. BTCUSD gibi 7/24 trade goren bir sembol
+  // chart'ta yuklu iken sonraki sembol (ETHUSDC, BTCXAU, ETHXAU, MONUSD…)
+  // yuklenmezse: chart.symbol() yeni adi (sembol guard'i pass), bars hala BTC'nin
+  // (stale guard pass — BTC barlari fresh), quote ve ohlcv ayni mainSeries.bars()
+  // kaynagindan okudugu icin deviation %0 (sapma guard'i pass) → kirletilmis
+  // BTC entry/SL/TP'siyle 5+ sembol icin sinyal uretildi, OKX Executor'a dispatch.
+  // Bu sebeple "bars degismedi" durumu artik fatal: bir kez setSymbol retry'i,
+  // hala degismediyse abort.
+  let dataChangeResult = await bridge.waitForDataChange(prevSnapshot, 10000);
   if (!dataChangeResult.changed) {
-    console.log(`[Scanner] ${symbol} TF${tf}: Bar verisi degismedi (10s timeout) — yeniden deneniyor`);
-    await sleep(2000);
+    console.log(`[Scanner] ${symbol} TF${tf}: Bar verisi degismedi (10s) — setSymbol yeniden deneniyor`);
+    await bridge.setSymbol(chartSymbol);
+    await bridge.setTimeframe(tf);
+    dataChangeResult = await bridge.waitForDataChange(prevSnapshot, 10000);
+    if (!dataChangeResult.changed) {
+      throw new Error(`${symbol} TF${tf}: Bar verisi 20s icinde degismedi — chart sembolu yuklemiyor, onceki sembolun barlari kirletme riski → ABORT`);
+    }
   }
 
   // CRITICAL: Verify chart is ACTUALLY showing our symbol BEFORE reading any data.
-  // EXACT bare-symbol match (no .includes) — "BA" must not pass as "BABA" / "BA.L" / "BIST:BA".
+  // EXACT bare-symbol match (assertBareSymbolMatch) — "BA" must not pass as
+  // "BABA" / "BA.L" / "BIST:BA". FAIL-CLOSED: bridge null donerse de abort
+  // (eski `if (preBare && ...)` formu null'da guard'i atliyordu).
   const bareExpected = bareSymbol.toUpperCase();
   const preBare = await bridge.getCurrentBareSymbol().catch(() => null);
-  if (preBare && preBare !== bareExpected) {
-    console.log(`[Scanner] ${symbol} TF${tf}: Chart yanlis sembolde (${preBare}) — yeniden degistiriliyor`);
+  const preCheck = assertBareSymbolMatch(preBare, bareExpected);
+  if (!preCheck.ok) {
+    console.log(`[Scanner] ${symbol} TF${tf}: ${preCheck.reason} — yeniden degistiriliyor`);
     await bridge.setSymbol(chartSymbol);
     await bridge.setTimeframe(tf);
     await sleep(4000);
     const recheck = await bridge.getCurrentBareSymbol().catch(() => null);
-    if (recheck && recheck !== bareExpected) {
-      throw new Error(`Sembol dogrulanamadi: istenen=${bareExpected}, chart=${recheck} — veri GUVENILMEZ, atlaniyor`);
+    const recheckRes = assertBareSymbolMatch(recheck, bareExpected);
+    if (!recheckRes.ok) {
+      throw new Error(`Sembol dogrulanamadi: ${recheckRes.reason} — veri GUVENILMEZ, atlaniyor`);
     }
   }
 
@@ -342,20 +407,28 @@ async function collectShortTermData(symbol, tf) {
     throw new Error(`${symbol} TF${tf}: OHLCV okuma aninda chart sembolu ${ohlcvData._got}, beklenen ${ohlcvData._expected} — veri CONTAMINATED`);
   }
 
-  // If OHLCV is stale (last bar too old for this TF), retry once
+  // If OHLCV is stale (last bar too old for this TF), retry once — sonra ABORT.
+  // Bayat veri FATAL: donmus bir chart (orn. sembol switch sonrasi veri akisi
+  // ilerlemedi) hem getOhlcv hem getQuote'a ayni eski bari dondurur. getQuote
+  // ve getOhlcv ayni mainSeries().bars() koleksiyonunu okudugu icin sapma
+  // guard'i (asagida) bu durumu yakalayamaz — deviation daima ~0. Stale veriyle
+  // tarama suren eski davranis, 15-Mayis BTCUSD sinyalinin 1-Mayis mumundan
+  // entry almasina yol acti. Stale veri ile sinyal uretilmez.
   if (ohlcvData?.stale) {
     console.log(`[Scanner] ${symbol} TF${tf}: Bar verisi stale (yas: ${ohlcvData.lastBarAge}s) — 3s bekleyip yeniden yukluyor`);
     await sleep(3000);
-    ohlcvData = await bridge.getOhlcvValidated(100, tf).catch(() => ohlcvData);
+    ohlcvData = await bridge.getOhlcvValidated(100, tf, chartSymbol).catch(() => ohlcvData);
     if (ohlcvData?.stale) {
-      console.log(`[Scanner] ${symbol} TF${tf}: UYARI — bar verisi hala stale (yas: ${ohlcvData.lastBarAge}s), devam ediliyor`);
+      throw new Error(`${symbol} TF${tf}: Bar verisi hala stale (yas: ${ohlcvData.lastBarAge}s) — chart donmus, veri GUVENILMEZ`);
     }
   }
 
-  // POST-READ: Verify chart symbol AGAIN — exact match (not includes).
+  // POST-READ: Verify chart symbol AGAIN — fail-closed (bridge null'i guard
+  // atlamasin; collectShortTermData sinyal uretim path'i, en agir guard sart).
   const postBare = await bridge.getCurrentBareSymbol().catch(() => null);
-  if (postBare && postBare !== bareExpected) {
-    throw new Error(`Veri okuma sirasinda sembol degismis: istenen=${bareExpected}, simdi=${postBare} — veri CONTAMINATED`);
+  const postCheck = assertBareSymbolMatch(postBare, bareExpected);
+  if (!postCheck.ok) {
+    throw new Error(`Veri okuma sirasinda sembol dogrulanamadi: ${postCheck.reason} — veri CONTAMINATED`);
   }
 
   // Validate OHLCV matches current symbol (compare against quote price)
@@ -370,13 +443,22 @@ async function collectShortTermData(symbol, tf) {
       // OHLCV data likely stale or for wrong symbol — retry with validated fetch
       console.log(`[Scanner] ${symbol} TF${tf}: OHLCV sapma %${(deviation * 100).toFixed(1)} > esik %${(maxDeviation * 100).toFixed(0)} (bar: ${lastClose}, quote: ${quotePrice}) — yeniden yukluyor`);
       await sleep(4000);
-      const retryOhlcv = await bridge.getOhlcvValidated(100, tf).catch(() => null);
+      // Retry path MUST also pass chartSymbol — aksi halde getOhlcvValidated
+      // symbol-mismatch guardini ATLAR ve onceki sembolden gelen barlari
+      // 'gecerli' kabul edebilir (collectShortTermData ana cagrisi gibi).
+      const retryOhlcv = await bridge.getOhlcvValidated(100, tf, chartSymbol).catch(() => null);
+      if (retryOhlcv?.symbolMismatch) {
+        throw new Error(`${symbol} TF${tf}: OHLCV retry symbol mismatch (beklenen ${retryOhlcv._expected}, alinan ${retryOhlcv._got}) — veri CONTAMINATED`);
+      }
       if (retryOhlcv?.bars?.length > 0) {
         const retryClose = retryOhlcv.bars[retryOhlcv.bars.length - 1].close;
         const retryDev = Math.abs(retryClose - quotePrice) / quotePrice;
         if (retryDev < maxDeviation) {
-          ohlcvData.bars = retryOhlcv.bars;
-          ohlcvData.total_bars = retryOhlcv.total_bars;
+          // Tam swap: bars + total_bars + stale + lastBarAge + lastBarTimestamp
+          // hepsi retry'nin guncel degerleriyle gelir. Onceki mutation davranisi
+          // sadece bars/total_bars'i overwrite edip stale/lastBarAge alanlarini
+          // eskimis halde birakiyordu — downstream learning/grader yanilirdi.
+          ohlcvData = mergeDeviationRetry(ohlcvData, retryOhlcv);
         } else if (retryOhlcv.stale) {
           throw new Error(`${symbol} TF${tf}: Bar verisi stale (yas: ${retryOhlcv.lastBarAge}s) ve sapma %${(retryDev * 100).toFixed(1)} — veri GUVENILMEZ`);
         } else {
@@ -549,40 +631,66 @@ async function collectLongTermData(symbol, tf) {
   const bareSymbol = symbol.includes(':') ? symbol.split(':')[1] : symbol;
   const chartSymbol = resolveChartSymbol(symbol);
 
+  // Pre-switch snapshot — collectShortTermData ile ayni kirletme tuzagi (bkz.
+  // 2026-05-23 bug): chart.symbol() istenen sembolu aninda dondurur ama bars
+  // hala onceki sembolun verisini tutuyor olabilir. HTF tarama da ayni fatal
+  // veriyi okur, dolayisiyla data-change guard'i burada da gerekli.
+  const prevSnapshot = await bridge.getBarSnapshot().catch(() => null);
+
   const symResult = await bridge.setSymbol(chartSymbol);
   if (symResult.success === false) {
     throw new Error(`Sembol degistirilemedi: ${chartSymbol}`);
   }
   await bridge.setTimeframe(tf);
-  await sleep(3000);
 
-  // Exact bare-symbol verification
+  let dataChangeResult = await bridge.waitForDataChange(prevSnapshot, 10000);
+  if (!dataChangeResult.changed) {
+    console.log(`[Scanner] ${symbol} TF${tf} (LTF): Bar verisi degismedi (10s) — setSymbol yeniden deneniyor`);
+    await bridge.setSymbol(chartSymbol);
+    await bridge.setTimeframe(tf);
+    dataChangeResult = await bridge.waitForDataChange(prevSnapshot, 10000);
+    if (!dataChangeResult.changed) {
+      throw new Error(`${symbol} TF${tf} (LTF): Bar verisi 20s icinde degismedi — chart sembolu yuklemiyor, veri kirletme riski → ABORT`);
+    }
+  }
+
+  // Exact bare-symbol verification — fail-closed (bkz. assertBareSymbolMatch).
   const bareExpected = bareSymbol.toUpperCase();
   const preBare = await bridge.getCurrentBareSymbol().catch(() => null);
-  if (preBare && preBare !== bareExpected) {
-    console.log(`[Scanner] ${symbol} TF${tf}: Chart yanlis sembolde (${preBare}) — retry`);
+  const preCheck = assertBareSymbolMatch(preBare, bareExpected);
+  if (!preCheck.ok) {
+    console.log(`[Scanner] ${symbol} TF${tf} (LTF): ${preCheck.reason} — retry`);
     await bridge.setSymbol(chartSymbol);
     await bridge.setTimeframe(tf);
     await sleep(4000);
     const recheck = await bridge.getCurrentBareSymbol().catch(() => null);
-    if (recheck && recheck !== bareExpected) {
-      throw new Error(`Sembol dogrulanamadi (LTF): istenen=${bareExpected}, chart=${recheck}`);
+    const recheckRes = assertBareSymbolMatch(recheck, bareExpected);
+    if (!recheckRes.ok) {
+      throw new Error(`Sembol dogrulanamadi (LTF): ${recheckRes.reason}`);
     }
   }
 
   const [ohlcvData, studyValues] = await Promise.all([
-    bridge.getOhlcv(100, false, chartSymbol).catch(() => null),
+    bridge.getOhlcvValidated(100, tf, chartSymbol).catch(() => null),
     bridge.getStudyValues().catch(() => null),
   ]);
 
-  if (ohlcvData && ohlcvData._symbolMismatch) {
-    throw new Error(`${symbol} TF${tf} (LTF): OHLCV symbol mismatch, beklenen ${ohlcvData._expected}, alinan ${ohlcvData._got}`);
+  // Hem validated symbolMismatch hem ham _symbolMismatch'i kabul et (bridge ikisini
+  // de set ediyor; collectShortTermData ile aynı konvansiyon).
+  if (ohlcvData && (ohlcvData.symbolMismatch || ohlcvData._symbolMismatch)) {
+    throw new Error(`${symbol} TF${tf} (LTF): OHLCV symbol mismatch, beklenen ${ohlcvData._expected}, alinan ${ohlcvData._got} — veri CONTAMINATED`);
   }
 
-  // Post-read verification — exact match
+  // Bayat veri fatal — donmus chart HTF baglamini da kirletir (bkz. HTF scan).
+  if (ohlcvData?.stale) {
+    throw new Error(`${symbol} TF${tf} (LTF): Bar verisi stale (yas: ${ohlcvData.lastBarAge}s) — chart donmus, veri GUVENILMEZ`);
+  }
+
+  // Post-read verification — fail-closed.
   const postBare = await bridge.getCurrentBareSymbol().catch(() => null);
-  if (postBare && postBare !== bareExpected) {
-    throw new Error(`Veri okuma sirasinda sembol degismis: istenen=${bareExpected}, simdi=${postBare}`);
+  const postCheck = assertBareSymbolMatch(postBare, bareExpected);
+  if (!postCheck.ok) {
+    throw new Error(`Veri okuma sirasinda sembol dogrulanamadi (LTF): ${postCheck.reason}`);
   }
 
   const bars = ohlcvData?.bars || [];
@@ -598,18 +706,36 @@ async function collectLongTermData(symbol, tf) {
 async function quickTrendCheck(symbol, tf) {
   try {
     const bareSymbol = symbol.includes(':') ? symbol.split(':')[1] : symbol;
+    const bareExpected = bareSymbol.toUpperCase();
     const chartSymbol = resolveChartSymbol(symbol);
+
+    // collectShortTermData ile ayni kirletme tuzagi (bkz. 2026-05-23 bug):
+    // chart.symbol() yeni adi aninda donebilir ama bars onceki sembolden olabilir.
+    // setSymbol + setTimeframe sonrasi bar verisinin DEGISTIGINI dogrula.
+    const prevSnapshot = await bridge.getBarSnapshot().catch(() => null);
     await bridge.setSymbol(chartSymbol);
     await bridge.setTimeframe(tf);
-    await sleep(2500);
-
-    // Verify symbol before reading
-    const currentSym = await bridge.getChartState().then(s => s?.symbol).catch(() => null);
-    if (currentSym && !currentSym.toUpperCase().includes(bareSymbol.toUpperCase())) {
-      return { direction: 'neutral', confidence: 0, reasoning: [`${tfLabel(tf)} sembol dogrulanamadi (${currentSym})`] };
+    const changed = await bridge.waitForDataChange(prevSnapshot, 8000).catch(() => ({ changed: false }));
+    if (!changed?.changed) {
+      return { direction: 'neutral', confidence: 0, reasoning: [`${tfLabel(tf)} bar verisi degismedi — trend okunamadi`] };
     }
 
-    const ohlcvData = await bridge.getOhlcv(100, false).catch(() => null);
+    // EXACT bare-symbol match (assertBareSymbolMatch) — "BA" "BABA"/"BIST:BA"
+    // gibi sembollerle eslesmemeli; aksi halde yanlis trend yonu okunur.
+    const currentBare = await bridge.getCurrentBareSymbol().catch(() => null);
+    const check = assertBareSymbolMatch(currentBare, bareExpected);
+    if (!check.ok) {
+      return { direction: 'neutral', confidence: 0, reasoning: [`${tfLabel(tf)} sembol dogrulanamadi: ${check.reason}`] };
+    }
+
+    // Validated OHLCV: hem stale hem symbol-mismatch guard'i. Wrong-symbol veya
+    // donmus bar trend kararini yanlis taraftan onaylar — bu trend hard veto
+    // olarak signal grade'ini etkiliyor, bu yuzden guvenilir veri sart.
+    const ohlcvData = await bridge.getOhlcvValidated(100, tf, chartSymbol).catch(() => null);
+    if (ohlcvData?.symbolMismatch || ohlcvData?.stale) {
+      const why = ohlcvData?.symbolMismatch ? 'sembol uyumsuz' : `stale (yas=${ohlcvData.lastBarAge}s)`;
+      return { direction: 'neutral', confidence: 0, reasoning: [`${tfLabel(tf)} trend verisi guvenilmez (${why})`] };
+    }
     const bars = ohlcvData?.bars || [];
     const parsedKS = calcTechnicals(bars);
     let longVotes = 0, shortVotes = 0;
@@ -657,6 +783,37 @@ async function _scanShortTermInner(symbol, options = {}) {
   const tfsToScan = singleTF ? [singleTF] : execTFs;
   const category = getAssetCategory(symbol);
   const abortCheck = options.abortCheck || (() => false);
+
+  // --- HTF fib cache gate (2026-05-22) ---
+  // Bir sembolde HTF fib cache eksik/bayatsa, sinyal acilmadan ONCE on-demand
+  // fib taramasi yapilir + cache yazilir; ardindan normal tarama taze cache'i
+  // okur. Refresh basarisizsa (TV baglantisi yok / yeterli HTF bar yok) bu
+  // sembolde GERCEK sinyal acilmaz: fibGateBlocked=true ile bestSignal asagida
+  // BEKLE'ye dusurulur. Scan lock cagiran (scanShortTerm/batchScan) tarafindan
+  // tutuluyor; refreshHTFFibForSymbol lock almaz.
+  let fibGateBlocked = false;
+  let fibGateReason = null;
+  if (!options.skipFibGate) {
+    try {
+      const _age = checkFibCacheAge(loadFibCache(symbol));
+      if (_age.missing || _age.stale) {
+        const ageLabel = _age.missing ? 'YOK' : `${_age.ageHours}h`;
+        console.log(`[Scanner] ${symbol}: HTF fib cache ${ageLabel} — on-demand refresh (sinyal bekletiliyor)`);
+        const fib = await refreshHTFFibForSymbol(symbol, category);
+        if (fib.ok) {
+          console.log(`[Scanner] ${symbol}: HTF fib cache tazelendi (on-demand)`);
+        } else {
+          fibGateBlocked = true;
+          fibGateReason = `HTF fib refresh basarisiz (${fib.reason}) — eksiklik giderilemedi, sinyal acilmadi`;
+          console.log(`[Scanner] ${symbol}: ${fibGateReason}`);
+        }
+      }
+    } catch (e) {
+      fibGateBlocked = true;
+      fibGateReason = `HTF fib refresh hata: ${e.message} — sinyal acilmadi`;
+      console.log(`[Scanner] ${symbol}: ${fibGateReason}`);
+    }
+  }
 
   const tfResults = {};
   const tfSignals = [];
@@ -835,7 +992,16 @@ async function _scanShortTermInner(symbol, options = {}) {
     // shadowResult.regime varsa o, yoksa legacy fallback.
     const regime = shadowResult?.regime || legacyRegime;
 
-    const signal = gradeShortTermSignal({
+    // Trendline hesabi — shadowMarketType burada cozulu (collectShortTermData
+    // icinde marketType henuz yok). Advisory; grade'i etkilemez.
+    const trendlines = calculateTrendlines({
+      bars: data.bars,
+      timeframe: tf,
+      marketType: shadowMarketType,
+      symbol,
+    });
+
+    const graderInput = {
       khanSaab: data.khanSaab,
       smc: data.smc,
       studyValues: data.studyValues,
@@ -863,7 +1029,11 @@ async function _scanShortTermInner(symbol, options = {}) {
       // Patch 2 — shadow primitives. Grader bunlari result.shadowMetrics +
       // result.shadowVotes olarak surface eder; tallyVotes'a girmez.
       shadow: data.shadow || null,
-    });
+      // Trendline advisory context — grade'e katki yok, sadece reasoning/warnings.
+      trendlines,
+    };
+
+    const signal = gradeShortTermSignal(graderInput);
     signal.regime = regime;
 
     // Apply higher-TF trend filter (KhanSaab: "First check trend on big TF")
@@ -880,9 +1050,18 @@ async function _scanShortTermInner(symbol, options = {}) {
         signal.warnings.push(`Yuksek TF trend ${higherTFTrend.direction.toUpperCase()}, sinyal ${signal.direction.toUpperCase()} — celiskili`);
         // 2026-05-03: HTF VETO kaldırıldı. Karşı-trend bilgi olarak reasoning'e yazılır,
         // grade liga sistemine + R:R/sanity filtrelerine bırakılır. Conviction yine kırpılır.
+        // 2026-05-16 PROMOTE: 14-gun korelasyonda HTF counter-trend (guven>=60) triggered
+        // WR=%33.3 vs untriggered %61 → Δ=-27.7%. Conviction*0.75 kirpilmasi yetmiyor;
+        // grade'i 1 kademe DAHA DUSUR.
         if ((higherTFTrend.confidence || 0) >= 60) {
-          signal.reasoning.push(`HTF counter-trend (guven ≥%60) — bilgi notu, BEKLE'ye dusurulmedi`);
           if (signal.tally) signal.tally.conviction = Math.round(signal.tally.conviction * 0.75 * 100) / 100;
+          if (signal.grade && ['A', 'B', 'C'].includes(signal.grade)) {
+            const _newGrade = signal.grade === 'A' ? 'B' : signal.grade === 'B' ? 'C' : 'BEKLE';
+            signal.reasoning.push(`HTF counter-trend (guven ≥%60) → grade ${signal.grade}→${_newGrade} dusuruldu (gozlemsel WR -27.7%, n=9)`);
+            signal.grade = _newGrade;
+          } else {
+            signal.reasoning.push(`HTF counter-trend (guven ≥%60) — conviction kirpildi (grade zaten A/B/C disinda)`);
+          }
         } else if (signal.tally) {
           signal.tally.conviction = Math.round(signal.tally.conviction * 0.60 * 100) / 100;
         }
@@ -905,10 +1084,19 @@ async function _scanShortTermInner(symbol, options = {}) {
 
       if (isFourHour) {
         // 2026-05-03: 4H için sert HTF gate kaldırıldı (advisory). Liga + R:R yeterli.
+        // 2026-05-16 PROMOTE: 14-gun korelasyonda 4H sinyalde 1D teyidi zayif olunca
+        // WR=%50 vs %60.4 (Δ=-10.4%, n=16). Hard BEKLE veto degil ama grade 1 kademe dusur.
         const t1dOk = t1d && t1d.direction === dir && (t1d.confidence || 0) >= 50;
         if (!t1dOk) {
-          signal.reasoning.push(`${dir.toUpperCase()} HTF GATE [4H]: 1D=${t1d?.direction || '?'}(%${t1d?.confidence || 0}) — 1D teyidi zayif (advisory, BEKLE'ye dusurulmedi)`);
-          signal.warnings.push(`HTF gate: 1D ${dir} teyidi eksik (advisory)`);
+          if (['A', 'B', 'C'].includes(signal.grade)) {
+            const _newGrade = signal.grade === 'A' ? 'B' : signal.grade === 'B' ? 'C' : 'BEKLE';
+            signal.reasoning.push(`${dir.toUpperCase()} HTF GATE [4H]: 1D=${t1d?.direction || '?'}(%${t1d?.confidence || 0}) → grade ${signal.grade}→${_newGrade} dusuruldu (gozlemsel WR -10.4%, n=16)`);
+            signal.warnings.push(`HTF gate: 1D ${dir} teyidi eksik → grade dusuruldu`);
+            signal.grade = _newGrade;
+          } else {
+            signal.reasoning.push(`${dir.toUpperCase()} HTF GATE [4H]: 1D=${t1d?.direction || '?'}(%${t1d?.confidence || 0}) — 1D teyidi zayif (grade zaten A/B/C disinda)`);
+            signal.warnings.push(`HTF gate: 1D ${dir} teyidi eksik (advisory)`);
+          }
         } else if (t1w && t1w.direction !== dir) {
           signal.warnings.push(`1W trend ${t1w.direction} (${dir} sinyale karsi) — dikkat`);
           signal.reasoning.push(`1W=${t1w.direction}(%${t1w.confidence || 0}) uyumsuz ama 1D teyit etti — gecti`);
@@ -939,6 +1127,24 @@ async function _scanShortTermInner(symbol, options = {}) {
     signal.khanSaabBias = data.khanSaab?.bias || null;
     signal.smc = data.smc;
     signal.macroFilter = macroFilter;
+    try {
+      recordDecisionSnapshot(buildDecisionSnapshot({
+        stage: 'per_tf',
+        symbol,
+        timeframe: tf,
+        mode: 'short',
+        graderInput,
+        signal,
+        context: {
+          category,
+          higherTFTrend,
+          regimeContext: regimeContextForGrader,
+          marketType: shadowMarketType,
+        },
+      }));
+    } catch (e) {
+      console.warn(`[DecisionSnapshot] ${symbol}/${tf} yazilamadi: ${e.message}`);
+    }
     tfSignals.push(signal);
   }
 
@@ -969,6 +1175,22 @@ async function _scanShortTermInner(symbol, options = {}) {
     return (b.tally?.conviction || 0) - (a.tally?.conviction || 0);
   });
   const bestSignal = tfSignals[0] || { grade: 'IPTAL', symbol, error: 'Sinyal yok' };
+
+  // --- HTF fib cache gate enforcement (2026-05-22) ---
+  // On-demand fib refresh basarisiz olduysa (yukarida fibGateBlocked) bu
+  // sembolde GERCEK sinyal acilmasin: tradable grade BEKLE'ye dusurulur,
+  // league virtual + position_pct 0 → executor dispatch ve gercek poz yok.
+  // Sinyal yine de "tamamlanir" (kart/analitik gorunur) ve scanner sonraki
+  // sembole gecer.
+  if (fibGateBlocked && bestSignal && ['A', 'B', 'C'].includes(bestSignal.grade)) {
+    bestSignal.reasoning = bestSignal.reasoning || [];
+    bestSignal.warnings = bestSignal.warnings || [];
+    bestSignal.warnings.push(`FIB GATE: ${fibGateReason}`);
+    bestSignal.reasoning.push(`--- FIB GATE: ${bestSignal.grade} → BEKLE (HTF fib eksikligi giderilemedi)`);
+    bestSignal.grade = 'BEKLE';
+    bestSignal.league = 'virtual';
+    bestSignal.position_pct = 0;
+  }
 
   // REGIME_GATES kalibrasyonu icin instrumentation (2026-05-12).
   // bestSignal per-TF gradeShortTermSignal cagrisinda mtfAlignment=null aliyordu
@@ -1036,6 +1258,12 @@ async function _scanShortTermInner(symbol, options = {}) {
     }
   } catch { /* shadow path: never blocks live decision */ }
 
+  // Attach fundamental snapshot (US equities only; null for other categories).
+  // Read-only: does NOT influence votes, grade, RR, direction, or position size.
+  try {
+    bestSignal.fundamentalSnapshot = buildFundamentalSnapshot({ symbol, category, now: new Date() });
+  } catch { bestSignal.fundamentalSnapshot = null; }
+
   // Shadow features — orthogonal telemetry candidates. Computed AFTER the
   // grader result + barrierSummary exist; read-only, no fetch, no shadow-
   // primitive recomputation. NEVER read by grade/direction/tally/rr/entry/sl/
@@ -1043,6 +1271,29 @@ async function _scanShortTermInner(symbol, options = {}) {
   try {
     bestSignal.shadowFeatures = computeShadowFeatures(bestSignal, { now: new Date() });
   } catch { bestSignal.shadowFeatures = null; }
+
+  try {
+    recordDecisionSnapshot(buildDecisionSnapshot({
+      stage: 'best_signal',
+      symbol,
+      timeframe: bestSignal.timeframe || bestSignal.tf || null,
+      mode: 'short',
+      graderInput: null,
+      signal: bestSignal,
+      context: {
+        category,
+        mtfConfirmation,
+        selectedFrom: tfSignals.map(s => ({
+          timeframe: s.timeframe || s.tf || null,
+          grade: s.grade || null,
+          direction: s.direction || null,
+          conviction: s.tally?.conviction ?? null,
+        })),
+      },
+    }));
+  } catch (e) {
+    console.warn(`[DecisionSnapshot] ${symbol}/best yazilamadi: ${e.message}`);
+  }
 
   // Record signal for learning (only non-IPTAL best signal)
   let transitionDirective = null;
@@ -1171,6 +1422,7 @@ async function _scanLongTermInner(symbol, options = {}) {
       if (entryIsLong !== trendIsLong) {
         entryTfResult.action = 'BEKLE';
         entryTfResult.combination = 'TREND UYUMSUZ';
+        entryTfResult.reasoning = entryTfResult.reasoning || [];
         entryTfResult.reasoning.push(
           `IPTAL: Giris yonu (${entryIsLong ? 'LONG' : 'SHORT'}) trend yonuyle (${trendAgreement.direction}) uyumsuz — uzun vadede trend disinda trade onerilmez`
         );
