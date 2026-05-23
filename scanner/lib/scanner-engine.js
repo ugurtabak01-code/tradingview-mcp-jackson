@@ -55,6 +55,11 @@ import { buildFundamentalSnapshot } from './fundamental/index.js';
 import { computeShadowFeatures } from './learning/shadow-features.js';
 import { loadWeights } from './learning/weight-adjuster.js';
 import { resolveSymbol, inferCategory } from './symbol-resolver.js';
+import {
+  symbolSwitchFailed, barDataTimeout, chartSymbolMismatch,
+  ohlcvContaminated, ohlcvStale, ohlcvDeviation,
+} from './errors.js';
+import { recordShadowDrop } from './shadow-metrics.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -502,7 +507,7 @@ async function collectShortTermData(symbol, tf) {
 
   const symResult = await bridge.setSymbol(chartSymbol);
   if (symResult.success === false) {
-    throw new Error(`Sembol degistirilemedi: ${chartSymbol} — ${symResult.warning || 'bilinmeyen hata'}`);
+    throw symbolSwitchFailed(symbol, chartSymbol, symResult.warning || 'bilinmeyen hata');
   }
   await bridge.setTimeframe(tf);
 
@@ -525,7 +530,7 @@ async function collectShortTermData(symbol, tf) {
     await bridge.setTimeframe(tf);
     dataChangeResult = await bridge.waitForDataChange(prevSnapshot, 10000);
     if (!dataChangeResult.changed) {
-      throw new Error(`${symbol} TF${tf}: Bar verisi 20s icinde degismedi — chart sembolu yuklemiyor, onceki sembolun barlari kirletme riski → ABORT`);
+      throw barDataTimeout(symbol, tf);
     }
   }
 
@@ -544,7 +549,7 @@ async function collectShortTermData(symbol, tf) {
     const recheck = await bridge.getCurrentBareSymbol().catch(() => null);
     const recheckRes = assertBareSymbolMatch(recheck, bareExpected);
     if (!recheckRes.ok) {
-      throw new Error(`Sembol dogrulanamadi: ${recheckRes.reason} — veri GUVENILMEZ, atlaniyor`);
+      throw chartSymbolMismatch(symbol, tf, recheckRes.reason);
     }
   }
 
@@ -559,7 +564,7 @@ async function collectShortTermData(symbol, tf) {
 
   // Guard: if OHLCV reported a symbol mismatch, abort — do NOT use contaminated bars
   if (ohlcvData && ohlcvData.symbolMismatch) {
-    throw new Error(`${symbol} TF${tf}: OHLCV okuma aninda chart sembolu ${ohlcvData._got}, beklenen ${ohlcvData._expected} — veri CONTAMINATED`);
+    throw ohlcvContaminated(symbol, tf, ohlcvData._expected, ohlcvData._got);
   }
 
   // If OHLCV is stale (last bar too old for this TF), retry once — sonra ABORT.
@@ -574,7 +579,7 @@ async function collectShortTermData(symbol, tf) {
     await sleep(3000);
     ohlcvData = await bridge.getOhlcvValidated(100, tf, chartSymbol).catch(() => ohlcvData);
     if (ohlcvData?.stale) {
-      throw new Error(`${symbol} TF${tf}: Bar verisi hala stale (yas: ${ohlcvData.lastBarAge}s) — chart donmus, veri GUVENILMEZ`);
+      throw ohlcvStale(symbol, tf, ohlcvData.lastBarAge, { retry: true });
     }
   }
 
@@ -583,7 +588,7 @@ async function collectShortTermData(symbol, tf) {
   const postBare = await bridge.getCurrentBareSymbol().catch(() => null);
   const postCheck = assertBareSymbolMatch(postBare, bareExpected);
   if (!postCheck.ok) {
-    throw new Error(`Veri okuma sirasinda sembol dogrulanamadi: ${postCheck.reason} — veri CONTAMINATED`);
+    throw chartSymbolMismatch(symbol, tf, postCheck.reason, { postRead: true });
   }
 
   // Validate OHLCV matches current symbol (compare against quote price)
@@ -603,7 +608,7 @@ async function collectShortTermData(symbol, tf) {
       // 'gecerli' kabul edebilir (collectShortTermData ana cagrisi gibi).
       const retryOhlcv = await bridge.getOhlcvValidated(100, tf, chartSymbol).catch(() => null);
       if (retryOhlcv?.symbolMismatch) {
-        throw new Error(`${symbol} TF${tf}: OHLCV retry symbol mismatch (beklenen ${retryOhlcv._expected}, alinan ${retryOhlcv._got}) — veri CONTAMINATED`);
+        throw ohlcvContaminated(symbol, tf, retryOhlcv._expected, retryOhlcv._got, { retry: true });
       }
       if (retryOhlcv?.bars?.length > 0) {
         const retryClose = retryOhlcv.bars[retryOhlcv.bars.length - 1].close;
@@ -615,9 +620,9 @@ async function collectShortTermData(symbol, tf) {
           // eskimis halde birakiyordu — downstream learning/grader yanilirdi.
           ohlcvData = mergeDeviationRetry(ohlcvData, retryOhlcv);
         } else if (retryOhlcv.stale) {
-          throw new Error(`${symbol} TF${tf}: Bar verisi stale (yas: ${retryOhlcv.lastBarAge}s) ve sapma %${(retryDev * 100).toFixed(1)} — veri GUVENILMEZ`);
+          throw ohlcvStale(symbol, tf, retryOhlcv.lastBarAge, { withDeviation: true, deviationPct: retryDev * 100 });
         } else {
-          throw new Error(`${symbol} TF${tf}: Fiyat dogrulanamadi (bar=${retryClose}, quote=${quotePrice}, sapma=%${(retryDev * 100).toFixed(1)}) — veri GUVENILMEZ`);
+          throw ohlcvDeviation(symbol, tf, retryClose, quotePrice, retryDev * 100);
         }
       }
     }
@@ -718,7 +723,7 @@ async function _computeShadowPrimitives({ symbol, tf, bars, parsedKS, parsedSMC,
       }
       out.rsiSeries = rsi.filter(v => v != null);
     }
-  } catch { /* ignore */ }
+  } catch (e) { recordShadowDrop('shadow_features', `rsiSeries: ${e?.message}`); }
 
   out.cmf = calcCMF(bars, 20);
   const mfiCur  = calcMFI(bars, 14);
@@ -765,7 +770,7 @@ async function _computeShadowPrimitives({ symbol, tf, bars, parsedKS, parsedSMC,
       out.fibCluster = findFibCluster(quotePrice, fibCache, 0.003);
       out.goldenZone = priceInGoldenZone(quotePrice, fibCache);
     }
-  } catch { /* fib cache absent — silent */ }
+  } catch (e) { recordShadowDrop('fib', e?.message || 'cache absent'); }
 
   // 200-bar fetch is intentionally NOT performed inside collectShortTermData
   // (the chart lock is held; an extra fetch would add latency to every TF).
@@ -794,7 +799,7 @@ async function collectLongTermData(symbol, tf) {
 
   const symResult = await bridge.setSymbol(chartSymbol);
   if (symResult.success === false) {
-    throw new Error(`Sembol degistirilemedi: ${chartSymbol}`);
+    throw symbolSwitchFailed(symbol, chartSymbol);
   }
   await bridge.setTimeframe(tf);
 
@@ -805,7 +810,7 @@ async function collectLongTermData(symbol, tf) {
     await bridge.setTimeframe(tf);
     dataChangeResult = await bridge.waitForDataChange(prevSnapshot, 10000);
     if (!dataChangeResult.changed) {
-      throw new Error(`${symbol} TF${tf} (LTF): Bar verisi 20s icinde degismedi — chart sembolu yuklemiyor, veri kirletme riski → ABORT`);
+      throw barDataTimeout(symbol, tf, true);
     }
   }
 
@@ -821,7 +826,7 @@ async function collectLongTermData(symbol, tf) {
     const recheck = await bridge.getCurrentBareSymbol().catch(() => null);
     const recheckRes = assertBareSymbolMatch(recheck, bareExpected);
     if (!recheckRes.ok) {
-      throw new Error(`Sembol dogrulanamadi (LTF): ${recheckRes.reason}`);
+      throw chartSymbolMismatch(symbol, tf, recheckRes.reason, { ltf: true });
     }
   }
 
@@ -833,19 +838,19 @@ async function collectLongTermData(symbol, tf) {
   // Hem validated symbolMismatch hem ham _symbolMismatch'i kabul et (bridge ikisini
   // de set ediyor; collectShortTermData ile aynı konvansiyon).
   if (ohlcvData && (ohlcvData.symbolMismatch || ohlcvData._symbolMismatch)) {
-    throw new Error(`${symbol} TF${tf} (LTF): OHLCV symbol mismatch, beklenen ${ohlcvData._expected}, alinan ${ohlcvData._got} — veri CONTAMINATED`);
+    throw ohlcvContaminated(symbol, tf, ohlcvData._expected, ohlcvData._got, { ltf: true });
   }
 
   // Bayat veri fatal — donmus chart HTF baglamini da kirletir (bkz. HTF scan).
   if (ohlcvData?.stale) {
-    throw new Error(`${symbol} TF${tf} (LTF): Bar verisi stale (yas: ${ohlcvData.lastBarAge}s) — chart donmus, veri GUVENILMEZ`);
+    throw ohlcvStale(symbol, tf, ohlcvData.lastBarAge, { ltf: true });
   }
 
   // Post-read verification — fail-closed.
   const postBare = await bridge.getCurrentBareSymbol().catch(() => null);
   const postCheck = assertBareSymbolMatch(postBare, bareExpected);
   if (!postCheck.ok) {
-    throw new Error(`Veri okuma sirasinda sembol dogrulanamadi (LTF): ${postCheck.reason}`);
+    throw chartSymbolMismatch(symbol, tf, postCheck.reason, { ltf: true, postRead: true });
   }
 
   const bars = ohlcvData?.bars || [];
@@ -1123,6 +1128,7 @@ async function _scanShortTermInner(symbol, options = {}) {
     } catch (shadowErr) {
       shadowResult = null;
       console.warn(`[shadow-regime] ${symbol}/${tf} hesaplama/log hatasi: ${shadowErr?.message || shadowErr}`);
+      recordShadowDrop('regime', shadowErr?.message);
     }
 
     // Faz 2 wrapper icin regimeContext sozlesmesi
@@ -1294,6 +1300,7 @@ async function _scanShortTermInner(symbol, options = {}) {
       }));
     } catch (e) {
       console.warn(`[DecisionSnapshot] ${symbol}/${tf} yazilamadi: ${e.message}`);
+      recordShadowDrop('snapshot', e?.message);
     }
     tfSignals.push(signal);
   }
@@ -1406,13 +1413,13 @@ async function _scanShortTermInner(symbol, options = {}) {
         bestSignal.shadowMetrics.mtfScore = mtfScore;
       }
     }
-  } catch { /* shadow path: never blocks live decision */ }
+  } catch (e) { recordShadowDrop('shadow_mtf', e?.message); /* never blocks live decision */ }
 
   // Attach fundamental snapshot (US equities only; null for other categories).
   // Read-only: does NOT influence votes, grade, RR, direction, or position size.
   try {
     bestSignal.fundamentalSnapshot = buildFundamentalSnapshot({ symbol, category, now: new Date() });
-  } catch { bestSignal.fundamentalSnapshot = null; }
+  } catch (e) { bestSignal.fundamentalSnapshot = null; recordShadowDrop('fundamentals', e?.message); }
 
   // Shadow features — orthogonal telemetry candidates. Computed AFTER the
   // grader result + barrierSummary exist; read-only, no fetch, no shadow-
@@ -1420,7 +1427,7 @@ async function _scanShortTermInner(symbol, options = {}) {
   // tp/position_pct/league/wrapper/scheduler/OKX dispatch.
   try {
     bestSignal.shadowFeatures = computeShadowFeatures(bestSignal, { now: new Date() });
-  } catch { bestSignal.shadowFeatures = null; }
+  } catch (e) { bestSignal.shadowFeatures = null; recordShadowDrop('shadow_features', e?.message); }
 
   try {
     recordDecisionSnapshot(buildDecisionSnapshot({
@@ -1443,6 +1450,7 @@ async function _scanShortTermInner(symbol, options = {}) {
     }));
   } catch (e) {
     console.warn(`[DecisionSnapshot] ${symbol}/best yazilamadi: ${e.message}`);
+    recordShadowDrop('snapshot', e?.message);
   }
 
   // Record signal for learning (only non-IPTAL best signal)
@@ -1453,7 +1461,7 @@ async function _scanShortTermInner(symbol, options = {}) {
       if (recorded?.transitionDirective) {
         transitionDirective = recorded.transitionDirective;
       }
-    } catch { /* learning recording failure should not block scanning */ }
+    } catch (e) { recordShadowDrop('learning', e?.message); /* should not block scanning */ }
   }
 
   // Build the comprehensive result
