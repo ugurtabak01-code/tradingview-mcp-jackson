@@ -571,10 +571,28 @@ async function ensureChartReady(symbol, tf) {
  * Returns raw collected data for that TF.
  */
 async function collectShortTermData(symbol, tf) {
-  // Patch 6 — adım 2: chart hazırlık katmanı (ensureChartReady) çıkarıldı.
-  // Sembol + TF setle → bar data değişimi bekle → pre-read bare verify.
-  // Sonraki katman (gatherRawBundle) bareExpected + chartSymbol ile çalışır.
-  const { chartSymbol, bareExpected } = await ensureChartReady(symbol, tf);
+  // Patch 6 — uc katmanli orchestration:
+  //   1. ensureChartReady: chart'i istenen sembol/TF'ye getir + pre-read verify
+  //   2. gatherRawBundle: raw veri (quote + OHLCV + study + SMC) + post-read +
+  //      deviation retry
+  //   3. enrichBundle: saf hesaplama (calculator + parser + shadow)
+  const ctx = await ensureChartReady(symbol, tf);
+  const raw = await gatherRawBundle(symbol, tf, ctx);
+  return enrichBundle({ symbol, tf, ...raw });
+}
+
+/**
+ * Patch 6 — adım 3: Raw veri toplama katmanı.
+ *
+ * Sorumluluk: chart hazır iken (ensureChartReady sonrası) raw verileri çek;
+ * symbol mismatch + stale + deviation guard'larını uygula; sembol kontaminasyon
+ * şüphesinde throw et. Saf değildir — bridge çağrıları içerir.
+ *
+ * Dönüş: { ohlcvData, studyValues, smc, quotePrice }. enrichBundle bunları
+ * tüketir.
+ */
+async function gatherRawBundle(symbol, tf, ctx) {
+  const { chartSymbol, bareExpected } = ctx;
 
   // Get quote price first for validation (independent of TF) — guard with expectedSymbol
   const quotePrice = await bridge.getQuote(chartSymbol).then(q => (q && !q._symbolMismatch ? q.close : null)).catch(() => null);
@@ -651,10 +669,7 @@ async function collectShortTermData(symbol, tf) {
     }
   }
 
-  // Patch 6 — Enrichment saf katmana (enrichBundle) tasindi: bridge cagrisi
-  // yapmaz; sadece raw veriyi (ohlcv/studyValues/smc/quotePrice) hesaplanmis
-  // alanlara cevirir. Bridge mock'suz unit testlenebilir.
-  return enrichBundle({ symbol, tf, ohlcvData, studyValues, smc, quotePrice });
+  return { ohlcvData, studyValues, smc, quotePrice };
 }
 
 /**
