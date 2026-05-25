@@ -8,6 +8,7 @@ import { inferCategory as resolveInferCategory, extractBaseAsset, getResolvedExc
 import { dispatchToOkxExecutor as dispatchToOkxExecutorShared } from '../okx-dispatcher.js';
 import { applyAlignmentFilters } from '../alignment-filters.js';
 import { resolveLeague } from './ladder-engine.js';
+import { routeLeagueForExecutor, isDisabled as isWrapperDisabled } from './wrapper-mode.js';
 
 /**
  * Dedup grup anahtari uretir.
@@ -331,6 +332,13 @@ export function refreshHTFBarrierLevelsForOpenSignals({ symbol = null } = {}) {
  * ve executor geri geldiginde otomatik drain edilir.
  */
 function dispatchToOkxExecutor(signal) {
+  // 2026-05-25 (Codex bug fix): wrapper mode=disabled iken hicbir cikis kanali
+  // emir POST etmemeli. Scheduler durdurulsa bile signal-tracker uzerinden
+  // recordSignal cagrilirsa burasi calisir; bu nedenle aktif kontrol gerek.
+  if (isWrapperDisabled()) {
+    console.log(`[OKX-Dispatch] ${signal.symbol} ${signal.grade}: dispatch skip (wrapper=disabled)`);
+    return;
+  }
   const cat = signal.category || resolveInferCategory(signal.symbol);
   if (cat !== 'kripto' && cat !== 'crypto') {
     // Diger kategoriler (hisse/emtia/forex) executor'a gitmez — sessiz cik.
@@ -341,8 +349,8 @@ function dispatchToOkxExecutor(signal) {
     return;
   }
   // 2026-05-03: Routing/sizing executor tarafinda league'e gore yapiliyor.
-  // 'real' → auto, 'ara' → awaiting_approval, 'virtual' → reject. Sadece
-  // virtual sinyali burada filtrele (kalanini executor degerlendirsin).
+  // 'real' → auto, 'ara' → awaiting_approval, 'virtual' → reject.
+  // 2026-05-21: ilk 5 gun real lig de ara gibi onaya dusurulur.
   if (signal.league === 'virtual') {
     console.log(`[OKX-Dispatch] ${signal.symbol} ${signal.grade}: dispatch skip (league=virtual)`);
     return;
@@ -354,12 +362,13 @@ function dispatchToOkxExecutor(signal) {
     console.log(`[Signal] ${signal.symbol}: pump-pullback limit dispatch (target ${signal.pendingPullback.target}, severity ${signal.pendingPullback.severity})`);
   }
 
+  const leagueRouting = routeLeagueForExecutor(signal.league || null);
   const payload = {
     symbol_tv: signal.symbol,
     tf: String(signal.timeframe ?? ''),
     side: signal.direction === 'short' ? 'short' : 'long',
     quality: signal.grade,
-    league: signal.league || undefined,
+    league: leagueRouting.league || undefined,
     entry: Number(signal.entry),
     sl: Number(signal.sl),
     tp1: signal.tp1 != null ? Number(signal.tp1) : undefined,
@@ -367,7 +376,10 @@ function dispatchToOkxExecutor(signal) {
     tp3: signal.tp3 != null ? Number(signal.tp3) : undefined,
     reason: {
       id: signal.id,
-      league: signal.league || null,
+      league: leagueRouting.league || null,
+      originalLeague: leagueRouting.originalLeague,
+      realLeagueApprovalOnly: leagueRouting.approvalOnlyActive,
+      realLeagueApprovalOnlyUntil: leagueRouting.approvalOnlyUntil,
       rr: signal.rr,
       indicators: signal.indicators,
       reasoning: signal.reasoning,

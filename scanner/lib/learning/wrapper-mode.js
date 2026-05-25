@@ -1,10 +1,9 @@
 /**
- * Wrapper Mode — Faz 2 dispatch kontrol bayrağı.
+ * Wrapper Mode — dispatch kontrol bayrağı.
  *
- * DeepSeek tavsiyesi: Faz 2 wrapper canlıya girdiğinde ilk 24 saat "shadow"
- * modunda — sinyal üretilir, A/B/C grade verilir, ama dispatch EDILMEZ.
- * Her karar wrapper-shadow-decisions.jsonl'a yazılır. 24 saat sonra
- * operatör /api/wrapper/mode ile "live" yapar.
+ * Shadow mode canlı sistemde geçerli değildir. Varsayılan mod live'dır.
+ * Geçiş güvenliği için ilk 5 gün real lig sinyalleri executor'a ara lig
+ * gibi gönderilir; böylece executor tarafında onaya düşer.
  *
  * Persist: scanner/data/wrapper-mode.json (restart-safe)
  */
@@ -16,14 +15,50 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = path.resolve(__dirname, '..', '..', 'data', 'wrapper-mode.json');
 
-const VALID_MODES = ['shadow', 'live', 'disabled'];
+const VALID_MODES = ['live', 'disabled'];
+const REAL_LEAGUE_APPROVAL_DAYS = 5;
+
+function approvalUntilFrom(now = new Date()) {
+  return new Date(now.getTime() + REAL_LEAGUE_APPROVAL_DAYS * 24 * 60 * 60 * 1000).toISOString();
+}
 
 function defaultState() {
   return {
-    mode: 'shadow',          // ilk açılışta default shadow
+    mode: 'live',
     since: new Date().toISOString(),
+    realLeagueApprovalOnlyUntil: approvalUntilFrom(),
     history: [],
   };
+}
+
+function normalizeState(raw) {
+  const now = new Date().toISOString();
+  if (!raw || typeof raw !== 'object') return defaultState();
+  if (!VALID_MODES.includes(raw.mode)) {
+    const next = {
+      mode: 'live',
+      since: now,
+      realLeagueApprovalOnlyUntil: raw.realLeagueApprovalOnlyUntil || approvalUntilFrom(new Date(now)),
+      history: [...(raw.history || []), {
+        from: raw.mode || null,
+        to: 'live',
+        at: now,
+        by: 'wrapper-mode-migration',
+        reason: 'shadow mode removed',
+      }].slice(-100),
+    };
+    writeState(next);
+    return next;
+  }
+  if (!raw.realLeagueApprovalOnlyUntil) {
+    const next = {
+      ...raw,
+      realLeagueApprovalOnlyUntil: approvalUntilFrom(new Date(raw.since || now)),
+    };
+    writeState(next);
+    return next;
+  }
+  return raw;
 }
 
 function readState() {
@@ -33,9 +68,9 @@ function readState() {
       writeState(s);
       return s;
     }
-    return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+    return normalizeState(JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')));
   } catch (err) {
-    console.error('[wrapper-mode] read failed, defaulting to shadow:', err.message);
+    console.error('[wrapper-mode] read failed, defaulting to live:', err.message);
     return defaultState();
   }
 }
@@ -62,19 +97,72 @@ export function getWrapperMode() {
 }
 
 export function isLive() { return getWrapperMode().mode === 'live'; }
-export function isShadow() { return getWrapperMode().mode === 'shadow'; }
+export function isShadow() { return false; }
 export function isDisabled() { return getWrapperMode().mode === 'disabled'; }
 
+export function isRealLeagueApprovalOnly({ now = new Date() } = {}) {
+  const state = getWrapperMode();
+  const until = Date.parse(state.realLeagueApprovalOnlyUntil || '');
+  return state.mode === 'live' && Number.isFinite(until) && now.getTime() < until;
+}
+
+export function routeLeagueForExecutor(league, { now = new Date() } = {}) {
+  const originalLeague = league || null;
+  const approvalOnlyActive = originalLeague === 'real' && isRealLeagueApprovalOnly({ now });
+  return {
+    league: approvalOnlyActive ? 'ara' : originalLeague,
+    originalLeague,
+    approvalOnlyActive,
+    approvalOnlyUntil: getWrapperMode().realLeagueApprovalOnlyUntil || null,
+  };
+}
+
 /**
- * @param {{mode:'shadow'|'live'|'disabled', by:string, reason?:string}} opts
+ * @param {{mode:'live'|'disabled', by:string, reason?:string, realLeagueApprovalOnlyUntil?:string|null}} opts
  */
-export function setWrapperMode({ mode, by, reason = '' }) {
+export function setWrapperMode({ mode, by, reason = '', realLeagueApprovalOnlyUntil = undefined }) {
   if (!VALID_MODES.includes(mode)) throw new Error(`invalid mode: ${mode}`);
   const current = readState();
   const now = new Date().toISOString();
+
+  // 2026-05-25 (Codex bug fix P1): operator API'den approval-only window'u
+  // KISALTAMAZ. Sadece UZATILABILIR. Kabul kurallari:
+  //   - undefined  → mevcut deger korunur, yoksa default 5 gunluk window
+  //   - null       → reddedilir, mevcut korunur
+  //   - gecmis     → reddedilir
+  //   - >= max(current, default_min)  → kabul (uzatma)
+  //   - <  max(current, default_min)  → reddedilir (kisaltma yasak)
+  //
+  // default_min = approvalUntilFrom(now) yani su andan itibaren 5 gun. Boylece
+  // ilk kurulumda dahi 5 gun altina inilemez; sonradan da current'tan asagi
+  // cekilemez.
+  const defaultMin = approvalUntilFrom(new Date(now));
+  const minRequired = current.realLeagueApprovalOnlyUntil
+    && new Date(current.realLeagueApprovalOnlyUntil).getTime() > new Date(defaultMin).getTime()
+      ? current.realLeagueApprovalOnlyUntil
+      : defaultMin;
+
+  let nextApprovalUntil;
+  if (realLeagueApprovalOnlyUntil === undefined) {
+    nextApprovalUntil = current.realLeagueApprovalOnlyUntil || defaultMin;
+  } else {
+    const candidate = realLeagueApprovalOnlyUntil ? new Date(realLeagueApprovalOnlyUntil) : null;
+    const candidateMs = candidate && !isNaN(candidate.getTime()) ? candidate.getTime() : null;
+    const minMs = new Date(minRequired).getTime();
+    if (candidateMs !== null && candidateMs >= minMs) {
+      // Uzatma kabul.
+      nextApprovalUntil = realLeagueApprovalOnlyUntil;
+    } else {
+      // Kisaltma, gecmis veya null reddedilir; mevcut/min korunur.
+      nextApprovalUntil = minRequired;
+      console.warn(`[wrapper-mode] realLeagueApprovalOnlyUntil=${realLeagueApprovalOnlyUntil} reddedildi (kisaltma yasak; min=${minRequired})`);
+    }
+  }
+
   const next = {
     mode,
     since: now,
+    realLeagueApprovalOnlyUntil: nextApprovalUntil,
     history: [...(current.history || []), {
       from: current.mode, to: mode, at: now, by, reason,
     }].slice(-100),
@@ -91,4 +179,4 @@ export function _resetWrapperMode() {
   _cache = null;
 }
 
-export const __internals = { STATE_PATH, VALID_MODES };
+export const __internals = { STATE_PATH, VALID_MODES, REAL_LEAGUE_APPROVAL_DAYS };

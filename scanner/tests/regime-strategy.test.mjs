@@ -281,6 +281,59 @@ test('15b. REGIME_GATES minRR alanı (Faz 2 v2.1)', () => {
   assert.equal(REGIME_GATES.market_closed.minRR, null);
 });
 
+// =============================================================================
+// Codex bug fix P1 regression — realLeagueApprovalOnlyUntil non-shortenable.
+// setWrapperMode operator API'den 5 gunluk approval-only window'u
+// kisaltamamali (null/gecmis/kisa tarih reddedilir, sadece uzatma kabul).
+// =============================================================================
+
+test('approval-window: alan gonderilmezse default 5 gun veya mevcut korunmali', () => {
+  _resetWrapperMode();
+  const state = setWrapperMode({ mode: 'live', by: 'unit_test' });
+  const setMs = new Date(state.realLeagueApprovalOnlyUntil).getTime();
+  const fiveDaysFromNow = Date.now() + 5 * 24 * 60 * 60 * 1000;
+  // 5 gun ile esitlik 1 saniye tolerans icinde olmali
+  assert.ok(Math.abs(setMs - fiveDaysFromNow) < 5000, `default ~5 gun olmali, gercek diff=${setMs - fiveDaysFromNow}ms`);
+});
+
+test('approval-window: null reddedilir, minRequired korunur', () => {
+  _resetWrapperMode();
+  const initial = setWrapperMode({ mode: 'live', by: 'unit_test' });
+  const minRequired = new Date(initial.realLeagueApprovalOnlyUntil).getTime();
+  const state = setWrapperMode({ mode: 'live', by: 'unit_test', realLeagueApprovalOnlyUntil: null });
+  const setMs = new Date(state.realLeagueApprovalOnlyUntil).getTime();
+  assert.ok(setMs >= minRequired, 'null kisaltma reddedilmeli');
+});
+
+test('approval-window: gecmis tarih reddedilir', () => {
+  _resetWrapperMode();
+  const initial = setWrapperMode({ mode: 'live', by: 'unit_test' });
+  const minRequired = new Date(initial.realLeagueApprovalOnlyUntil).getTime();
+  const past = new Date(Date.now() - 1000).toISOString();
+  const state = setWrapperMode({ mode: 'live', by: 'unit_test', realLeagueApprovalOnlyUntil: past });
+  const setMs = new Date(state.realLeagueApprovalOnlyUntil).getTime();
+  assert.ok(setMs >= minRequired, 'gecmis tarih kisaltmasi reddedilmeli');
+});
+
+test('approval-window: kisa fakat gelecek tarih reddedilir (now+1sn)', () => {
+  _resetWrapperMode();
+  const initial = setWrapperMode({ mode: 'live', by: 'unit_test' });
+  const minRequired = new Date(initial.realLeagueApprovalOnlyUntil).getTime();
+  const oneSecLater = new Date(Date.now() + 1000).toISOString();
+  const state = setWrapperMode({ mode: 'live', by: 'unit_test', realLeagueApprovalOnlyUntil: oneSecLater });
+  const setMs = new Date(state.realLeagueApprovalOnlyUntil).getTime();
+  assert.ok(setMs >= minRequired, "1 saniyelik gelecek kisaltma reddedilmeli");
+});
+
+test('approval-window: mevcuttan ileri tarih kabul edilir (uzatma)', () => {
+  _resetWrapperMode();
+  const initial = setWrapperMode({ mode: 'live', by: 'unit_test' });
+  const initialMs = new Date(initial.realLeagueApprovalOnlyUntil).getTime();
+  const extendedIso = new Date(initialMs + 10 * 24 * 60 * 60 * 1000).toISOString();
+  const state = setWrapperMode({ mode: 'live', by: 'unit_test', realLeagueApprovalOnlyUntil: extendedIso });
+  assert.equal(state.realLeagueApprovalOnlyUntil, extendedIso, 'uzatma kabul edilmeli');
+});
+
 test('15. JSONL log üretildi mi?', () => {
   applyRegimeStrategy({
     regimeContext: { regime: 'ranging', newPositionAllowed: true },

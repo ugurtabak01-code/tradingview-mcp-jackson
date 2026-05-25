@@ -20,7 +20,7 @@ import { batchScan } from './scanner-engine.js';
 import { ensureConnection } from './tv-bridge.js';
 import { dispatchToOkxExecutor as dispatchToOkxExecutorShared } from './okx-dispatcher.js';
 import { isHalted, getHaltState } from './halt-state.js';
-import { isLive as isWrapperLive, getWrapperMode } from './learning/wrapper-mode.js';
+import { isDisabled as isWrapperDisabled, getWrapperMode, routeLeagueForExecutor } from './learning/wrapper-mode.js';
 import { getEntrySnapshot as getLadderEntrySnapshot } from './learning/ladder-engine.js';
 import {
   ALL_CATEGORIES,
@@ -59,9 +59,9 @@ function dispatchSignalNotify(signal) {
 }
 
 /**
- * OKX Executor'a (localhost:3939) gercek trade icin POST.
+ * OKX Executor'a (localhost:3939) trade sinyali POST et.
  * Sadece `kripto` kategorisinde, A/B/C kaliteli sinyaller iletilir.
- * A/B → otonom trade. C → dashboard'da manuel onay bekler.
+ * Geçiş penceresinde real lig de ara lig gibi onaya düşer.
  * Executor kapali/erisilemez ise sinyal `data/okx-queue.json`'a yazilir ve
  * executor ayaga kalkinca otomatik drain edilir (bkz. lib/okx-dispatcher.js).
  */
@@ -69,22 +69,22 @@ function dispatchToOkxExecutor(signal) {
   if (signal.category !== 'kripto' && signal.category !== 'crypto') return;
   if (!['A', 'B', 'C'].includes(signal.grade)) return;
   // 2026-05-03: routing/sizing artik executor tarafinda league'e gore yapiliyor.
-  // 'real' → auto, 'ara' → awaiting_approval, 'virtual' → reject. Burada virtual
-  // disindakileri serbest birakiyoruz.
+  // 'real' → auto, 'ara' → awaiting_approval, 'virtual' → reject.
+  // 2026-05-21: ilk 5 gun real lig de ara gibi onaya dusurulur.
   if (signal.league === 'virtual') return;
-  // Faz 2 wrapper shadow mode: dispatch yok (operator /api/wrapper/mode ile live'a geçer)
-  if (!isWrapperLive()) {
+  if (isWrapperDisabled()) {
     const m = getWrapperMode();
-    console.log(`[scheduler] dispatch SHADOW MODE (${m.mode}) → ${signal.symbol}/${signal.timeframe} ${signal.grade} log'landı, executor'a gönderilmedi`);
+    console.log(`[scheduler] dispatch DISABLED (${m.mode}) → ${signal.symbol}/${signal.timeframe} ${signal.grade} log'landı, executor'a gönderilmedi`);
     return;
   }
+  const leagueRouting = routeLeagueForExecutor(signal.league || null);
 
   const payload = {
     symbol_tv: signal.symbol,
     tf: String(signal.timeframe ?? ''),
     side: signal.direction === 'short' ? 'short' : 'long',
     quality: signal.grade,
-    league: signal.league || undefined,
+    league: leagueRouting.league || undefined,
     entry: Number(signal.entry),
     sl: Number(signal.sl),
     tp1: signal.tp1 != null ? Number(signal.tp1) : undefined,
@@ -92,7 +92,10 @@ function dispatchToOkxExecutor(signal) {
     tp3: signal.tp3 != null ? Number(signal.tp3) : undefined,
     reason: {
       id: signal.id,
-      league: signal.league || null, // approve flow'unda reason_json'dan okunabilir
+      league: leagueRouting.league || null, // approve flow'unda reason_json'dan okunabilir
+      originalLeague: leagueRouting.originalLeague,
+      realLeagueApprovalOnly: leagueRouting.approvalOnlyActive,
+      realLeagueApprovalOnlyUntil: leagueRouting.approvalOnlyUntil,
       rr: signal.rr,
       indicators: signal.indicators,
       reasoning: signal.reasoning,

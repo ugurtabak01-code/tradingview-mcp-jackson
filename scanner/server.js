@@ -180,27 +180,19 @@ app.get('/api/feed-health', (_req, res) => {
   res.json({ success: true, ...getFeedHealth() });
 });
 
-// Faz 2 — Wrapper mode (rejim-aware sinyal wrapper'i shadow/live geçişi)
-// Default: shadow (signal'ler üretilir + log'lanır ama dispatch yok)
-// 24 saat shadow log incelendikten sonra operator live'a geçer.
+// Wrapper mode — live varsayilan, shadow geçerli mod değildir.
+// disabled yalnizca operator tarafindan manuel durdurma icin kullanilir.
 app.get('/api/wrapper/mode', (_req, res) => {
   res.json({ success: true, ...getWrapperMode() });
 });
 
 app.post('/api/wrapper/mode', (req, res) => {
-  const { mode, by, reason = 'manual_change', confirm } = req.body || {};
+  const { mode, by, reason = 'manual_change', realLeagueApprovalOnlyUntil } = req.body || {};
   if (!by || !mode) {
     return res.status(400).json({ success: false, error: '`mode` ve `by` gerekli' });
   }
-  // Live'a geçiş için onay zorunlu (shadow log incelenmeden açılmasın diye)
-  if (mode === 'live' && confirm !== 'I_REVIEWED_SHADOW_LOG') {
-    return res.status(400).json({
-      success: false,
-      error: 'live moduna geçiş için confirm: "I_REVIEWED_SHADOW_LOG" zorunlu (24h shadow log review garantisi)',
-    });
-  }
   try {
-    const state = setWrapperMode({ mode, by, reason });
+    const state = setWrapperMode({ mode, by, reason, realLeagueApprovalOnlyUntil });
     broadcastWS({ type: 'wrapper_mode_changed', mode: state.mode, by, reason });
     res.json({ success: true, ...state });
   } catch (err) {
