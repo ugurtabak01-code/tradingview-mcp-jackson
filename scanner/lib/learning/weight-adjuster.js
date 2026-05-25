@@ -8,6 +8,11 @@ import { readJSON, writeJSON, dataPath, readAllArchives } from './persistence.js
 import { recomputeAllStats } from './stats-engine.js';
 import { scoreAllIndicators, scoreIndicatorsForSubset } from './indicator-scorer.js';
 import { preCommitCheck, createCheckpoint, evaluatePendingCheckpoints } from './shadow-guard.js';
+// CRITICAL BUG FIX (2026-05-15): DEFAULT_VOTE_WEIGHTS adjustIndicatorWeights /
+// adjustFromFaultyTrades / adjustRegimeSpecificWeights icinde referans veriliyordu
+// ama import edilmemisti -> indikator delta ogrenmesi her tetiklendiginde
+// ReferenceError ile patliyordu (cycle abort, hicbir indikator agirligi guncellenmez).
+import { DEFAULT_VOTE_WEIGHTS } from '../signal-grader.js';
 
 // Faulty trade adjustment parameters
 const FAULTY_MIN_COUNT = 3;     // en az 3 hatali goren indikator ayarlanir
@@ -119,17 +124,30 @@ function sumRecentWeightChanges(log, key, nowMs) {
 
 /**
  * Proposed weight'i rate cap ile kirpa. Son 24h kümülatif + proposed delta,
- * baseline24h (veya current) * 0.20 degerini asmamali.
- * Clip tetiklenirse warn log + capped deger dondurulur.
+ * baseRef (indikator base agirligi) * 0.20 degerini asmamali.
+ *
+ * BUG FIX (2026-05-15, additive_v1 sonrasi): Onceki versiyon baseline'i
+ * `baseline24h` (gecmis from degeri) veya `max(currentWeight, 0.01)` ile
+ * hesapliyordu. Additive (Δ) modunda currentWeight artik Δ-degeri — Δ=0 veya
+ * negatif iken cap=0.002 cikiyor, hicbir ogrenme commit edilemiyordu. Cozum:
+ * cap'i indikator BASE agirligi (DEFAULT_VOTE_WEIGHTS) uzerinden hesapla;
+ * Δ aralığı zaten [-base, +base] oldugundan ölçek tutarli.
+ *
+ * Backward compat: baseRef verilmezse currentWeight |abs| fallback kullanir
+ * (eski multiplicative cagrilar icin).
  */
-function rateCapClip(weights, key, currentWeight, proposedWeight) {
+function rateCapClip(weights, key, currentWeight, proposedWeight, baseRef = null) {
   if (!Number.isFinite(currentWeight) || !Number.isFinite(proposedWeight)) return proposedWeight;
   if (currentWeight === proposedWeight) return proposedWeight;
 
   if (!weights.weightChangeLog) weights.weightChangeLog = {};
   const nowMs = Date.now();
-  const { sum24h, baseline24h } = sumRecentWeightChanges(weights.weightChangeLog, key, nowMs);
-  const baseline = (baseline24h != null && baseline24h > 0) ? baseline24h : Math.max(currentWeight, 0.01);
+  const { sum24h } = sumRecentWeightChanges(weights.weightChangeLog, key, nowMs);
+  // Cap baseline'i: oncelikle base agirlik (additive Δ semantigine uygun),
+  // yoksa |currentWeight| (legacy multiplicative path), yoksa minimum 0.01.
+  const baseline = (Number.isFinite(baseRef) && baseRef > 0)
+    ? baseRef
+    : Math.max(Math.abs(currentWeight), 0.01);
   const proposedDelta = Math.abs(proposedWeight - currentWeight);
   const totalIfCommitted = sum24h + proposedDelta;
   const cap = baseline * MAX_WEIGHT_RATE_PER_DAY;
@@ -357,7 +375,8 @@ function adjustIndicatorWeights(weights, indicatorScores) {
     const dampedDelta = Math.round((currentDelta + (targetDelta - currentDelta) * 0.5) * 100) / 100;
 
     // Rate cap: günlük toplam değişim Δ-uzayında 0.20×Base ile sınırlı (eski %20 multiplier sınırının dengi).
-    const finalDelta = rateCapClip(weights, key, currentDelta, dampedDelta);
+    // BUG FIX: base argumani gecilmeli — aksi halde Δ<=0 keyleri icin cap=0.002'ye duser.
+    const finalDelta = rateCapClip(weights, key, currentDelta, dampedDelta, base);
 
     if (Math.abs(finalDelta - currentDelta) >= 0.02) {
       weights.indicatorWeights[key] = finalDelta;
@@ -640,6 +659,10 @@ function adjustFromFaultyTrades(weights, faultyStats, totalSignals, statsByTF = 
     const reduced = Math.round(Math.max(floorDelta, current - step) * 100) / 100;
     if (reduced < current) {
       weights.indicatorWeights[weightKey] = reduced;
+      // BUG FIX: faulty-driven degisiklik weightChangeLog'a yazilmaliydi —
+      // aksi halde rate-cap muhasebesi (24h kümülatif Δ) bu adimi sayamaz ve
+      // ayni gunde adjustIndicatorWeights tarafindan tam bütce yeniden açılır.
+      logWeightChange(weights, weightKey, current, reduced);
       const eff = Math.max(0, base + reduced).toFixed(2);
       changes.push(
         `[FAULTY] ${weightKey} Δ: ${current.toFixed(2)} → ${reduced.toFixed(2)} (Base ${base.toFixed(2)}, Eff ${eff}; ${guiltKey} ${count}/${totalSignals} hatali, %${Math.round(guiltRate * 10000) / 100})`
@@ -716,6 +739,8 @@ const INDICATOR_KEY_MAP = {
   smc_bos: 'smc_bos', smc_choch: 'smc_choch', smc_ob: 'smc_ob', smc_fvg: 'smc_fvg',
   formation: 'formation', rsi_divergence: 'rsi_divergence', squeeze_filter: 'squeeze_filter',
   cdv: 'cdv', macro_filter: 'macro_filter', volume_confirm: 'volume_confirm',
+  // Shadow-promoted (2026-05-15) — identity map (scorer key = weight key)
+  golden_zone: 'golden_zone', eq_liquidity: 'eq_liquidity', rsi_failure_swing: 'rsi_failure_swing',
 };
 
 function adjustRegimeSpecificWeights(weights) {
@@ -761,7 +786,9 @@ function adjustRegimeSpecificWeights(weights) {
       // Faz 0 Part 2: rate cap per-regime key (rejim + indikator scoped).
       // Log key: "regime:{regime}:{weightKey}" → ayni key'i global ile karistirmaz.
       const scopedKey = `regime:${regime}:${weightKey}`;
-      const finalRegimeW = rateCapClip(weights, scopedKey, currentRegimeW, damped);
+      // BUG FIX: base argumani gecilmeli — additive Δ semantiginde currentRegimeW
+      // genellikle 0 veya negatif; eski cagri cap'i fiilen sifirliyordu.
+      const finalRegimeW = rateCapClip(weights, scopedKey, currentRegimeW, damped, base);
 
       if (Math.abs(finalRegimeW - currentRegimeW) >= 0.02) {
         rw[weightKey] = finalRegimeW;
@@ -769,6 +796,109 @@ function adjustRegimeSpecificWeights(weights) {
         const capNote = finalRegimeW !== damped ? ' [RATE-CAPPED]' : '';
         changes.push(`rejim[${regime}] ${weightKey}: ${currentRegimeW} → ${finalRegimeW} (lift: ${score.lift}%, n=${score.aligned_count})${capNote}`);
       }
+    }
+  }
+
+  return changes;
+}
+
+// =============================================================================
+// CATEGORY-SPECIFIC LEARNING (2026-05-16)
+// =============================================================================
+// Kategori bazli vote-weight carpanlari (voteWeightsByCategory[cat][key]).
+// Manuel seed (cdv/macd/ema_cross/smc_bos) kullanici tarafindan baslatildi;
+// bu fonksiyon sonraki ogrenme dongulerinde veriden devam eder. Multiplicative
+// tabloya yaziyor (additive Δ degil) cunku signal-grader carpani
+// `Math.max(0, base + Δ_global) × catMult` formuyle uyguluyor — mevcut yapi
+// korunsun ki manuel seed semantigi bozulmasin.
+//
+// Su an YALNIZCA crypto icin aktif. Diger kategoriler aciliyorsa
+// CATEGORIES_LEARNED listesine ekle.
+// =============================================================================
+const CATEGORIES_LEARNED = ['crypto']; // scanner-engine 'crypto' kullanir; 'kripto' degil.
+const CATEGORY_MIN_SAMPLES = 30;
+const CATEGORY_MULT_MIN = 0.30;
+const CATEGORY_MULT_MAX = 2.00;
+const CATEGORY_MULT_DAILY_CAP = 0.15; // gunde max |Δmult| 0.15
+
+function _countRecentCategoryChanges(weights, scopedKey, nowMs) {
+  const log = weights.weightChangeLog?.[scopedKey] || [];
+  const cutoff = nowMs - DAY_MS;
+  let sumAbs = 0;
+  for (const e of log) {
+    if (!e?.at) continue;
+    if (Date.parse(e.at) < cutoff) continue;
+    sumAbs += Math.abs((e.to ?? 0) - (e.from ?? 0));
+  }
+  return sumAbs;
+}
+
+function adjustCategorySpecificWeights(weights) {
+  const changes = [];
+  const all = (readAllArchives() || []).filter(s => s.grade !== 'BEKLE' && s.category && s.win != null);
+  if (all.length === 0) return changes;
+
+  if (!weights.voteWeightsByCategory) weights.voteWeightsByCategory = {};
+
+  for (const category of CATEGORIES_LEARNED) {
+    // category-tier.js 'crypto'/'forex'/'us_stock'/'bist'/'commodity' uretir;
+    // rules.json watchlist anahtarlari 'kripto'/'abd_hisse' vs. Ikisi de
+    // kabul edilsin (signal storage'inda hangisi yazildi ise).
+    const aliases = category === 'crypto' ? ['crypto', 'kripto'] : [category];
+    const subset = all.filter(s => aliases.includes(String(s.category).toLowerCase()));
+    if (subset.length < CATEGORY_MIN_SAMPLES) {
+      changes.push(`kategori[${category}] atlandi — yetersiz veri (${subset.length}/${CATEGORY_MIN_SAMPLES})`);
+      continue;
+    }
+
+    const scores = scoreIndicatorsForSubset(subset);
+    if (!weights.voteWeightsByCategory[category]) weights.voteWeightsByCategory[category] = {};
+    const cw = weights.voteWeightsByCategory[category];
+
+    for (const [scorerKey, score] of Object.entries(scores)) {
+      if (!score || score.aligned_count < 20) continue;
+      // Significance: regime-spesifikten daha gevsek — kategori sample'i daha az.
+      // Ancak yon kararlilig icin z>1.6 (alpha~0.10) gerekli.
+      if (Math.abs(score.z_score) < 1.0 && score.classification !== 'load_bearing' && score.classification !== 'counterproductive') {
+        continue;
+      }
+      const weightKey = INDICATOR_KEY_MAP[scorerKey];
+      if (!weightKey) continue;
+
+      const current = Number.isFinite(cw[weightKey]) ? cw[weightKey] : 1.0;
+      // Multiplicative step — classification'a göre carpani hedefe yaklastir
+      let target = current;
+      switch (score.classification) {
+        case 'load_bearing':     target = current * 1.10; break;
+        case 'useful':           target = current * 1.05; break;
+        case 'decorative':       target = current * 0.95; break;
+        case 'counterproductive':target = current * 0.80; break;
+        default: continue;
+      }
+      target = clamp(target, CATEGORY_MULT_MIN, CATEGORY_MULT_MAX);
+      // 50% damping
+      const damped = Math.round((current + (target - current) * 0.5) * 100) / 100;
+      if (damped === current) continue;
+
+      // Daily rate-cap (her kategori×key icin)
+      const scopedKey = `category:${category}:${weightKey}`;
+      const proposedDelta = Math.abs(damped - current);
+      const recentSum = _countRecentCategoryChanges(weights, scopedKey, Date.now());
+      const headroom = Math.max(0, CATEGORY_MULT_DAILY_CAP - recentSum);
+      let final = damped;
+      if (proposedDelta > headroom) {
+        const dir = damped > current ? 1 : -1;
+        final = Math.round((current + dir * headroom) * 100) / 100;
+      }
+      if (Math.abs(final - current) < 0.02) continue; // anlamsiz adim
+
+      cw[weightKey] = final;
+      logWeightChange(weights, scopedKey, current, final);
+      const capNote = final !== damped ? ' [RATE-CAPPED]' : '';
+      changes.push(
+        `kategori[${category}] ${weightKey}: ${current.toFixed(2)} → ${final.toFixed(2)} ` +
+        `(lift ${score.lift}%, z=${score.z_score?.toFixed?.(2) ?? '?'}, n=${score.aligned_count}, ${score.classification})${capNote}`
+      );
     }
   }
 
@@ -864,6 +994,9 @@ export function evaluateAndAdjust() {
   // allChanges.push(...detectPromotions(weights, bySymbolVirtual, allVirtualArchives));
   allChanges.push(...adjustSLMultipliers(weights, byTFReal));
   allChanges.push(...adjustRegimeSpecificWeights(weights));
+  // Kategori-spesifik ogrenme (2026-05-16). Su an YALNIZCA crypto aktif.
+  // Manuel seed'i veriden kalibre eder; gunluk rate cap %15.
+  allChanges.push(...adjustCategorySpecificWeights(weights));
   // Bug #1 fix: ayni dongude WR-bazli reliability dusurulen TF'leri faulty handler'a
   // skipTfs olarak ver → cifte sayim yok. Bug #2 fix: byTFReal ile base-rate karsilastirmasi.
   allChanges.push(...adjustFromFaultyTrades(

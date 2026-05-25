@@ -79,13 +79,17 @@ export function resolveCategory(symbol) {
       if (String(sym).toUpperCase() === bare) return CAT_MAP[bucket] || bucket;
     }
   }
-  // Heuristik fallback
-  if (/^(XAU|XAG|COPPER|OIL|WTI|BRENT|NATGAS|PLAT|PALL)/.test(bare)) return 'commodity';
-  if (bare.endsWith('USDT') || bare.endsWith('USDC')) return 'crypto';
-  // Crypto with USD quote (BTCUSD, ETHUSD, SOLUSD)
-  if (/^(BTC|ETH|SOL|XRP|DOGE|ADA|AVAX|SUI|HYPE|DOT|LINK|PEPE|RENDER|MON|ARB|OP|INJ|TIA|NEAR)/.test(bare) && bare.endsWith('USD')) return 'crypto';
+  // Bug fix (2026-05-16): perpetual suffix (.P / .PS) heuristic kontrolleri
+  // bozuyordu — "BTCUSDT.P" gibi watchlist-disi crypto perp'ler 'unknown'a
+  // dusuyordu ve voteWeightsByCategory.crypto carpanlari uygulanmiyordu.
+  const baseSym = bare.replace(/\.P[S]?$/i, '');
+  // Heuristik fallback (perp suffix temizlenmis bare uzerinde)
+  if (/^(XAU|XAG|COPPER|OIL|WTI|BRENT|NATGAS|PLAT|PALL)/.test(baseSym)) return 'commodity';
+  if (baseSym.endsWith('USDT') || baseSym.endsWith('USDC')) return 'crypto';
+  // Crypto with USD quote (BTCUSD, ETHUSD, SOLUSD) — baseSym perp-stripped
+  if (/^(BTC|ETH|SOL|XRP|DOGE|ADA|AVAX|SUI|HYPE|DOT|LINK|PEPE|RENDER|MON|ARB|OP|INJ|TIA|NEAR)/.test(baseSym) && baseSym.endsWith('USD')) return 'crypto';
   // 6-harf forex cifti (EURUSD, GBPUSD, etc.)
-  if (/^(EUR|USD|GBP|JPY|CHF|AUD|NZD|CAD|TRY|MXN|ZAR|SEK|NOK)/.test(bare) && bare.length === 6) return 'forex';
+  if (/^(EUR|USD|GBP|JPY|CHF|AUD|NZD|CAD|TRY|MXN|ZAR|SEK|NOK)/.test(baseSym) && baseSym.length === 6) return 'forex';
   const exchange = String(symbol).toUpperCase().includes(':') ? String(symbol).toUpperCase().split(':')[0] : '';
   if (exchange === 'BIST') return 'bist';
   // Default: ABD hisse (watchlist disindaki duz tickerlar)

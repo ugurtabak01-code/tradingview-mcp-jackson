@@ -221,6 +221,39 @@ export function evaluateSignalOutcome(signal, currentBar) {
   }
 
   const entryActive = alreadyReached || updates.entryHit;
+  const entryConfirmedOnCurrentBar = isSmartEntry && updates.entryHit === true
+    && (!signal.entryHit || signal.entryHitPrice == null);
+
+  // Bad-tick guard (aktif pozisyonlar icin). Canli tick path'i
+  // (live-outcome-processor) ham Binance WS / Yahoo tick'lerini sentetik bar
+  // olarak DOGRUDAN bu fonksiyona besler ve TV-loop'taki %10 sapma on-filtresine
+  // (outcome-checker checkOpenSignals) sahip degildir. Bozuk tek bir tick
+  // (feed/borsa glitch — ornegin ~62$ sembolde 83.79) aktif pozisyonda yanlis
+  // SL hit tetikleyip pozisyonu kapatip OKX'e dispatch edebilir. Referanstan
+  // (son dogrulanan fiyat ya da entry) %10'dan fazla sapan tick'i reddet:
+  // status/hit URETME, sadece uyari don. Tuketici bu "uyari-only" sonucu
+  // sessizce atlar (live-outcome-processor:70) ve lastCheckedPrice'i bozmaz.
+  if (entryActive && Number.isFinite(close)) {
+    const refPrice = (Number.isFinite(signal.lastCheckedPrice) && signal.lastCheckedPrice > 0)
+      ? signal.lastCheckedPrice
+      : (Number.isFinite(signal.entry) && signal.entry > 0 ? signal.entry : null);
+    if (refPrice != null) {
+      const deviation = Math.abs(close - refPrice) / refPrice;
+      if (deviation > 0.10) {
+        return {
+          lastCheckedAt: now,
+          checkCount: (signal.checkCount || 0) + 1,
+          warnings: appendWarning(signal, `[BadTick] Fiyat sapmasi cok yuksek (ref=${refPrice}, tick=${close}, sapma=%${(deviation * 100).toFixed(1)}) — atlandi`),
+        };
+      }
+    }
+  }
+
+  // Bir toplu mum smart entry'ye ilk kez dokunuyorsa, mum icindeki entry ile
+  // SL/TP hareketinin sirasi bilinemez. Bu mum sadece entry aktivasyonunu
+  // kaydeder; sonraki mumlar outcome uretir. Canli tek-fiyat tick yolunda da
+  // entry fiyatinda SL/TP seviyesi bulunmadigi icin davranis kaybi yaratmaz.
+  if (entryConfirmedOnCurrentBar) return updates;
 
   // Compute favorable/adverse excursion (only after entry is reached).
   // 0'a clamp: MFE/MAE tanim geregi negatif olamaz (hareket olmamissa 0).
@@ -580,6 +613,42 @@ function getCheckTimeframe(signalTF) {
   return '5'; // Use 5m for all short-term signals
 }
 
+function getBarStartMs(bar) {
+  if (typeof bar?.time === 'number') {
+    return bar.time < 1e12 ? bar.time * 1000 : bar.time;
+  }
+  const parsed = new Date(bar?.time).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Return only bars that can contain unprocessed post-entry movement.
+ *
+ * For established active signals the partially elapsed bar overlapping the
+ * last check is kept, because a new wick can have formed since that check.
+ * For any entry activated mid-bar, that partial entry bar is excluded: OHLC
+ * does not disclose whether its extreme happened before activation.
+ */
+export function filterOutcomeBarsForSignal(signal, bars, checkTFMinutes) {
+  if (!Array.isArray(bars) || bars.length === 0) return [];
+
+  const durationMs = Math.max(1, Number(checkTFMinutes) || 1) * 60 * 1000;
+  const lastCheckedMs = signal?.lastCheckedAt ? new Date(signal.lastCheckedAt).getTime() : NaN;
+  const isSmartEntry = isSmartEntrySignal(signal);
+  const activationAt = signal?.entryHitAt || (!isSmartEntry ? signal?.createdAt : null);
+  const entryActiveAtMs = (signal?.entryHit || !isSmartEntry) && activationAt
+    ? new Date(activationAt).getTime()
+    : NaN;
+
+  return bars.filter(bar => {
+    const startMs = getBarStartMs(bar);
+    if (startMs == null) return true;
+    if (Number.isFinite(entryActiveAtMs) && startMs < entryActiveAtMs) return false;
+    if (Number.isFinite(lastCheckedMs) && startMs + durationMs <= lastCheckedMs) return false;
+    return true;
+  });
+}
+
 /**
  * Check all open signals against current prices.
  * FIXED: Sets correct timeframe per signal, validates prices.
@@ -700,8 +769,10 @@ async function _checkAllOpenSignalsInner(signals) {
             errors++;
             continue;
           }
-          const bars = ohlcv?.bars || [];
-          if (bars.length === 0) { errors++; continue; }
+          const rawBars = ohlcv?.bars || [];
+          if (rawBars.length === 0) { errors++; continue; }
+          const bars = filterOutcomeBarsForSignal(sig, rawBars, checkTFMinutes);
+          if (bars.length === 0) continue;
 
           const lastClose = bars[bars.length - 1].close;
 
@@ -750,11 +821,12 @@ async function _checkAllOpenSignalsInner(signals) {
                 await new Promise(r => setTimeout(r, 1200));
                 const tfMinutes = parseInt(checkTF, 10) || 5;
                 const oneMin = await bridge.getOhlcv(tfMinutes + 5, false);
-                const oneBars = (oneMin?.bars || []).filter(b => {
+                const oneBarsInWindow = (oneMin?.bars || []).filter(b => {
                   const t = typeof b.time === 'number' ? b.time * (b.time < 1e12 ? 1000 : 1) : new Date(b.time).getTime();
                   const barT = typeof bar.time === 'number' ? bar.time * (bar.time < 1e12 ? 1000 : 1) : new Date(bar.time).getTime();
                   return t >= barT && t < barT + tfMinutes * 60000;
                 });
+                const oneBars = filterOutcomeBarsForSignal(sig, oneBarsInWindow, 1);
                 for (const m of oneBars) {
                   const updates = evaluateSignalOutcome(updated, m);
                   if (!updates) continue;

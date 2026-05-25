@@ -642,6 +642,7 @@ export function generateDigest(windowHours = 24) {
     weightVersion: weights.version,
     highlights: buildHighlights({
       mode: anomaly.mode,
+      advisory: anomaly.advisory,
       wrRecent,
       recentCount: recentResolved.length,
       rollbacksCount: rollbacks.length,
@@ -650,10 +651,14 @@ export function generateDigest(windowHours = 24) {
   };
 }
 
-function buildHighlights({ mode, wrRecent, recentCount, rollbacksCount, adjCount }) {
+function buildHighlights({ mode, advisory, wrRecent, recentCount, rollbacksCount, adjCount }) {
   const out = [];
   if (mode === 'degraded') {
-    out.push({ level: 'critical', msg: 'Sistem DEGRADED modda — yeni poz acilmiyor, grade\'ler 1 kademe dusuruldu' });
+    out.push({ level: 'critical', msg: 'Sistem DEGRADED modda — yeni poz acilmiyor (grade\'ler ladder/lig sistemine birakildi)' });
+  }
+  const vai = (advisory || []).find(a => a.type === 'virtual_alpha_inversion');
+  if (vai) {
+    out.push({ level: 'warn', msg: `Virtual-alpha advisory: BEKLE WR %${vai.virtualWR} > Real WR %${vai.realWR} (+${vai.gap}p) — grading kalibrasyon firsati, degraded degil` });
   }
   if (rollbacksCount > 0) {
     out.push({ level: 'warn', msg: `${rollbacksCount} agirlik degisikligi otomatik geri alindi (performans dustu)` });

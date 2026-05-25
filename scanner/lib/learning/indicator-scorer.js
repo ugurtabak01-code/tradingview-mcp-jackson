@@ -118,6 +118,19 @@ function classifyIndicator(signal, indicatorKey) {
       if (!mtf || mtf.direction === 'mixed') return 'absent';
       return mtf.direction === dir ? 'aligned' : 'opposed';
     }
+    // ─── Shadow-promoted indicators (2026-05-15) ──────────────────────────
+    // voteBreakdown snapshot'tan oku — bu indikatorler shadow primitiflerden
+    // emit ediliyor (golden_zone/eq_liquidity/rsi_failure_swing); indicators
+    // objesinde ham veri yok ama voteBreakdown'da live vote olarak duruyor.
+    case 'golden_zone':
+    case 'eq_liquidity':
+    case 'rsi_failure_swing': {
+      const vb = signal.voteBreakdown;
+      if (!Array.isArray(vb)) return 'absent';
+      const v = vb.find(x => x.source === indicatorKey);
+      if (!v || !v.direction) return 'absent';
+      return v.direction === dir ? 'aligned' : 'opposed';
+    }
     default:
       return 'absent';
   }
@@ -216,6 +229,8 @@ export function scoreAllIndicators() {
     'khanSaab_score', 'smc_bos', 'smc_choch', 'smc_ob', 'smc_fvg',
     'formation', 'rsi_divergence', 'squeeze_filter', 'cdv',
     'macro_filter', 'volume_confirm', 'mtf_confirmation',
+    // Shadow-promoted (2026-05-15)
+    'golden_zone', 'eq_liquidity', 'rsi_failure_swing',
   ];
 
   const scoreSet = (signals) => {
@@ -261,6 +276,8 @@ export function scoreIndicatorsForSubset(signals) {
     'khanSaab_score', 'smc_bos', 'smc_choch', 'smc_ob', 'smc_fvg',
     'formation', 'rsi_divergence', 'squeeze_filter', 'cdv',
     'macro_filter', 'volume_confirm', 'mtf_confirmation',
+    // Shadow-promoted (2026-05-15)
+    'golden_zone', 'eq_liquidity', 'rsi_failure_swing',
   ];
   const out = {};
   for (const key of indicatorKeys) out[key] = scoreIndicator(key, signals || []);

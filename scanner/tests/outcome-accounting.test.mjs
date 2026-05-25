@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildArchiveRecord, evaluateSignalOutcome } from '../lib/learning/outcome-checker.js';
+import { buildArchiveRecord, evaluateSignalOutcome, filterOutcomeBarsForSignal } from '../lib/learning/outcome-checker.js';
 import { summarizeResolvedSignalsForReport } from '../lib/learning/learning-reporter.js';
 import { isPlausibleYahooPrice } from '../lib/yahoo-price-feed.js';
 import { isMarketTradeable } from '../lib/market-hours.js';
@@ -283,6 +283,71 @@ test('smart long entry does not fill before price touches entry', () => {
 
   assert.equal(updates.entryHit, undefined);
   assert.equal(updates.entryHitAt, undefined);
+});
+
+test('smart entry does not realize TP from the aggregate bar that first touches entry', () => {
+  const updates = evaluateSignalOutcome({
+    id: 'sig_TAOUSDTP_240_entry_bar',
+    symbol: 'TAOUSDT.P',
+    direction: 'short',
+    status: 'open',
+    entrySource: 'smc_ob',
+    entryHit: false,
+    entry: 279.36,
+    sl: 290.92557142857146,
+    tp1: 270.99389285714284,
+    atr: 9.077857142857143,
+  }, {
+    time: '2026-05-23T17:45:00.000Z',
+    high: 280,
+    low: 267.44,
+    close: 269.18,
+  });
+
+  assert.equal(updates.entryHit, true);
+  assert.equal(updates.tp1Hit, undefined);
+  assert.equal(updates.trailingStopActive, undefined);
+});
+
+test('periodic replay excludes smart-entry candles before the recorded fill boundary', () => {
+  const signal = {
+    id: 'sig_TAOUSDTP_240_1779541716',
+    entrySource: 'smc_ob',
+    entryHit: true,
+    entryHitAt: '2026-05-23T20:37:22.785Z',
+    lastCheckedAt: '2026-05-23T20:37:52.086Z',
+  };
+  const bars = [
+    { time: '2026-05-23T17:45:00.000Z', high: 269.89, low: 267.44, close: 269.18 },
+    { time: '2026-05-23T18:00:00.000Z', high: 273.15, low: 268.17, close: 272.99 },
+    { time: '2026-05-23T20:30:00.000Z', high: 283.83, low: 275.42, close: 283.42 },
+    { time: '2026-05-23T20:45:00.000Z', high: 286.04, low: 283.48, close: 284.27 },
+  ];
+
+  assert.deepEqual(
+    filterOutcomeBarsForSignal(signal, bars, 15).map(bar => bar.time),
+    ['2026-05-23T20:45:00.000Z'],
+  );
+});
+
+test('periodic replay excludes market-entry candles before the signal creation boundary', () => {
+  const signal = {
+    id: 'sig_MARKET_ENTRY',
+    entrySource: 'quote_price',
+    entryHit: true,
+    entryHitAt: '2026-05-23T20:37:22.785Z',
+    createdAt: '2026-05-23T20:37:22.785Z',
+  };
+  const bars = [
+    { time: '2026-05-23T20:15:00.000Z', high: 100, low: 95, close: 98 },
+    { time: '2026-05-23T20:30:00.000Z', high: 101, low: 96, close: 99 },
+    { time: '2026-05-23T20:45:00.000Z', high: 102, low: 97, close: 100 },
+  ];
+
+  assert.deepEqual(
+    filterOutcomeBarsForSignal(signal, bars, 15).map(bar => bar.time),
+    ['2026-05-23T20:45:00.000Z'],
+  );
 });
 
 test('outcome checker rejects bad equity tick before false SL hit', () => {

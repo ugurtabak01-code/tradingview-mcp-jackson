@@ -44,6 +44,7 @@ function loadState() {
     mode: 'normal',         // 'normal' | 'degraded'
     since: null,
     triggeredBy: null,
+    advisory: [],           // degraded'e sokmayan kalibrasyon sinyalleri ( or. virtual_alpha)
     lastCheck: null,
     history: [],
   });
@@ -98,7 +99,10 @@ export function evaluateAnomaly() {
     return { mode: state.mode, transitioned: false, reason: 'yetersiz arsiv' };
   }
 
+  // Blocking tetikleyiciler degraded moda sokar. Advisory tetikleyiciler yalniz
+  // telemetry/operator gorunurlugu icindir; mod gecisini ve recovery'yi etkilemez.
   const triggers = [];
+  const advisoryTriggers = [];
 
   // Trigger 1: WR 2-sigma asagida mi?
   const recent = archives.slice(-DEGRADE_WINDOW);
@@ -138,14 +142,16 @@ export function evaluateAnomaly() {
 
   // Trigger 4: virtual-alpha-inversion — BEKLE (rejected) ligasi Real ligayi
   // tutarli sekilde dovuyor mu? Eger evetse grading filtremiz kazananlari reddediyor
-  // kaybedenleri geciriyor demek. Manual/anomaly incelemesi zorunlu.
+  // kaybedenleri geciriyor demek. 2026-05-21: ARTIK degraded GEREKCESI DEGIL — bu
+  // bir grading-kalibrasyon sinyali (BEKLE WR yuksekse degraded'e sokmak yanlis,
+  // edge'i Real lige tasimak gerek). Hesap aynen surer, advisory olarak kaydedilir.
   if (archives.length >= VIRTUAL_ALPHA_MIN_REAL_N && virtualArchives.length >= VIRTUAL_ALPHA_MIN_VIRTUAL_N) {
     const realSample = archives.slice(-Math.min(100, archives.length));
     const virtualSample = virtualArchives.slice(-Math.min(100, virtualArchives.length));
     const realWR = computeWR(realSample);
     const virtualWR = computeWR(virtualSample);
     if (realWR != null && virtualWR != null && virtualWR - realWR >= VIRTUAL_ALPHA_INVERSION_THRESHOLD) {
-      triggers.push({
+      advisoryTriggers.push({
         type: 'virtual_alpha_inversion',
         realWR: Math.round(realWR * 10) / 10,
         virtualWR: Math.round(virtualWR * 10) / 10,
@@ -215,6 +221,9 @@ export function evaluateAnomaly() {
     }
   }
 
+  // Advisory tetikleyiciler (degraded'e sokmaz) operator gorunurlugu icin saklanir.
+  state.advisory = advisoryTriggers;
+
   // history sinirli tut
   if (state.history.length > 100) state.history = state.history.slice(-100);
 
@@ -223,6 +232,7 @@ export function evaluateAnomaly() {
     mode: state.mode,
     transitioned: previousMode !== state.mode,
     triggers,
+    advisory: advisoryTriggers,
     since: state.since,
   };
 }

@@ -123,6 +123,20 @@ export function reconcileSmartEntryHitState(existing, scanResult, now = new Date
   return existing;
 }
 
+export function shouldFreezeExecutedLevelUpdate(existing) {
+  if (!existing) return false;
+  return !!(
+    existing.entryHit ||
+    existing.tp1Hit ||
+    existing.tp2Hit ||
+    existing.tp3Hit ||
+    existing.slHit ||
+    existing.status === 'tp1_hit' ||
+    existing.status === 'tp2_hit' ||
+    existing.status === 'sl_hit'
+  );
+}
+
 function missedSetupCooldownMs(timeframe) {
   const tfMin = timeframeToMinutes(timeframe);
   return Math.max(2 * 60 * 60 * 1000, Math.min(24 * 60 * 60 * 1000, tfMin * 8 * 60 * 1000));
@@ -562,9 +576,11 @@ export function recordSignal(scanResult) {
     const existTFRank = tfRank[sameDir.timeframe] ?? 0;
     const betterGrade = newGradeRank < existGradeRank;
     const sameGradeHigherTF = newGradeRank === existGradeRank && newTFRank > existTFRank;
-    // TP1/TP2 vurmus sinyalde fiyat seviyeleri (entry/SL/TP) donmus olmali —
-    // aksi halde tp1Hit:true + yeni tp1 degeri tutarsiz kayit olusturur.
-    const levelsFrozen = sameDir.status === 'tp1_hit' || sameDir.status === 'tp2_hit';
+    // Entry dolduktan sonra fiyat seviyeleri donmus olmali. Aksi halde
+    // createdAt/entryHitAt eski kalirken entry/SL/TP yeni taramanin seviyelerine
+    // tasinir ve pozisyon gecmiste hic islem gormedigi bir fiyattan acilmis gibi
+    // gorunur.
+    const levelsFrozen = shouldFreezeExecutedLevelUpdate(sameDir);
     const shouldUpgradeLevels = (betterGrade || sameGradeHigherTF) && !levelsFrozen;
     const shouldRefreshHTFBarrierLevels = shouldRefreshBarrierLevels(sameDir, scanResult, { levelsFrozen });
 
@@ -758,6 +774,9 @@ export function recordSignal(scanResult) {
     entrySource: scanResult.entrySource || 'lastbar_close',
     entryZone: scanResult.entryZone || null,
     entryReasoning: scanResult.entryReasoning || [],
+    // Smart entry telemetri (shadow-only) — quote_price'a neden dusuldugu,
+    // OB sayisi/uzakligi/mitigation, inside-OB tespiti. Karar mantigi okumaz.
+    smartEntryDiagnostics: scanResult.smartEntryDiagnostics || null,
     quotePrice: scanResult.quotePrice || null,
     slSource: scanResult.slSource || 'atr_based',
     slReason: scanResult.slReason || null,

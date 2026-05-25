@@ -5,6 +5,7 @@ import {
   findRecentMissedSetup,
   reconcileSmartEntryHitState,
   sanitizeReverseAttemptsForDashboard,
+  shouldFreezeExecutedLevelUpdate,
   shouldRefreshBarrierLevels,
   timeframeToMinutes,
   validateSignalPriceLevels,
@@ -52,6 +53,21 @@ test('does not refresh TP levels after TP ladder has started', () => {
   };
 
   assert.equal(shouldRefreshBarrierLevels(existing, scanResult, { levelsFrozen: true }), false);
+});
+
+test('freezes price levels after entry has been filled', () => {
+  assert.equal(shouldFreezeExecutedLevelUpdate({
+    status: 'open',
+    entrySource: 'quote_price',
+    entryHit: true,
+    entryHitAt: '2026-05-15T16:18:00.420Z',
+  }), true);
+
+  assert.equal(shouldFreezeExecutedLevelUpdate({
+    status: 'open',
+    entrySource: 'smc_ob',
+    entryHit: false,
+  }), false);
 });
 
 test('does not refresh unrelated non-barrier TP changes', () => {
