@@ -225,6 +225,14 @@ const DEFAULT_VOTE_WEIGHTS = {
   liquidity_sweep: 1.8, // Swing high/low sweep-and-reclaim — SMC'nin en guvenilir reversal setup'i
   premium_discount: 1.0, // Fiyat aralik icinde premium/discount konumu — mean-reversion bias
   vwap_position: 0.8,   // VWAP ust/alt — KhanSaab-turevli, korelasyon decay grubunda
+  // ─── Shadow promotion (2026-05-15) — analyze-shadow-indicators.mjs sonuclari ───
+  // Shadow havuzdan 143 resolved sinyalde gozlemlenen lift'e gore live'a alindi.
+  // Conservative baz agirliklar (shadow olcumlerinden 1:1) — weight-adjuster
+  // canli verilerde ileride otomatik kalibre eder. Tam istatistiksel anlam icin
+  // gerekli sample (n>=20 aligned) henuz yok; preliminary tier.
+  golden_zone: 0.8,          // Boroden ch.3 fib golden zone (38.2-61.8) — n=9 aligned, WR %77.8, lift +%19.7
+  eq_liquidity: 0.7,         // King p.50 EQH/EQL likidite egilimi  — n=13 aligned, WR %69.2, lift +%11.2
+  rsi_failure_swing: 1.0,    // Wilder/Swanson failure swing       — n=18 aligned, WR %61.1, lift +%3.1
 };
 
 // KhanSaab-turevli oylar (hepsi KhanSaab dashboard'undan + ayni trend'den turer):
@@ -279,7 +287,7 @@ function smcDirectionToTradeDirection(direction) {
   return null;
 }
 
-function collectVotes({ khanSaab, smc, studyValues, ohlcv, formation, squeeze, divergence, cdv, macroFilter, stochRSI, regime, symbol }) {
+function collectVotes({ khanSaab, smc, studyValues, ohlcv, formation, squeeze, divergence, cdv, macroFilter, stochRSI, regime, symbol, shadow = null }) {
   const votes = [];
   const w = getWeights(regime);
   const iw = w.indicatorWeights || {};
@@ -393,14 +401,41 @@ function collectVotes({ khanSaab, smc, studyValues, ohlcv, formation, squeeze, d
       }
     }
 
-    // ADX trend strength — CRITICAL filter (backtest: EMA+ADX PF 2.16-2.21)
+    // ADX trend strength — kademeli seviye + slope-duyarli (klasik DMI / Linda Raschke).
+    // Seviyeler:  <20 trend yok | 20-25 notr/gecis | 25-40 guclu trend (ideal) |
+    //             40-50 cok guclu (uzama riski) | >50 asiri uzama (ters donus riski)
+    // Slope (khanSaab.adxDirection: scanner-engine 3-bar fark): rising=trend gucleniyor,
+    // falling=momentum kaybi (fiyat hala yonde gitse bile), flat=yatay.
     if (khanSaab.adx != null) {
-      if (khanSaab.adx > 25) {
-        // Strong trend — amplify all momentum signals
-        votes.push({ source: 'adx_trend', direction: null, weight: voteWeight('adx_trend'), reasoning: `ADX ${khanSaab.adx} — guclu trend, momentum sinyalleri guvenilir` });
-      } else if (khanSaab.adx < 20) {
-        // No trend — PENALIZE momentum signals (backtest: mean reversion PF < 1.0 in range)
-        votes.push({ source: 'adx_trend', direction: null, weight: -voteWeight('adx_trend') * 0.8, reasoning: `ADX ${khanSaab.adx} — trend yok, momentum sinyalleri ZAYIF` });
+      const adxV = Number(khanSaab.adx);
+      const baseW = voteWeight('adx_trend');
+      const slopeDir = khanSaab.adxDirection || null; // 'rising'|'falling'|'flat'|null
+
+      // Seviye katsayisi (baseW ile carpilir).
+      let tierW = 0, tierMsg = '';
+      if (adxV >= 50)      { tierW =  0.20; tierMsg = 'asiri uzama (>50) — ters donus riski'; }
+      else if (adxV >= 40) { tierW =  0.65; tierMsg = 'cok guclu trend (40-50) — uzama riski'; }
+      else if (adxV >= 25) { tierW =  1.00; tierMsg = 'guclu trend (25-40) — momentum guvenilir'; }
+      else if (adxV >= 20) { tierW =  0.25; tierMsg = 'notr/gecis bolgesi (20-25)'; }
+      else                 { tierW = -0.80; tierMsg = 'trend yok (<20) — momentum ZAYIF'; }
+
+      // Slope carpani — yalniz pozitif (trend lehine) oylarda uygulanir.
+      // rising guclu odul, falling sert ceza (trend yorgunlugunun erken sinyali).
+      // >50 asiri uzamada yukselen ADX bile risk → rising bonusu notrlenir.
+      let slopeMult = 1.0, slopeTag = '';
+      if (slopeDir === 'rising')  { slopeMult = adxV >= 50 ? 1.0 : 1.30; slopeTag = ' ↗ gucleniyor'; }
+      else if (slopeDir === 'falling') { slopeMult = 0.55; slopeTag = ' ↘ momentum kaybi'; }
+      else if (slopeDir === 'flat') { slopeMult = 1.0; slopeTag = ' → yatay'; }
+      const effSlopeMult = tierW > 0 ? slopeMult : 1.0;
+
+      const w = baseW * tierW * effSlopeMult;
+      if (w !== 0) {
+        votes.push({
+          source: 'adx_trend',
+          direction: null,
+          weight: w,
+          reasoning: `ADX ${adxV}${slopeTag} — ${tierMsg}`,
+        });
       }
     }
 
@@ -634,6 +669,60 @@ function collectVotes({ khanSaab, smc, studyValues, ohlcv, formation, squeeze, d
   const obShort = votes.filter(v => SMC_OB_GROUP.has(v.source) && v.direction === 'short');
   applyDecay(obLong, SMC_OB_DECAY, 'SMC OB decay');
   applyDecay(obShort, SMC_OB_DECAY, 'SMC OB decay');
+
+  // ─── Promoted shadow indicators (2026-05-15) ──────────────────────────
+  // Shadow havuzda gozlemlenen lift'e gore live vote olarak emit ediliyor.
+  // Conservative tier: weight'ler DEFAULT_VOTE_WEIGHTS'te 0.7-1.0 araliginda
+  // tutuluyor (shadow olcumlerine kiyasla %20-30 indirim). Weight-adjuster
+  // ileride live verilerle Δ kalibre eder. Hala shadowVotes path'inde de
+  // kayitli — instrumentation continuity icin (live emit'den onceki sample
+  // ile sonraki karsilastirilabilsin).
+  if (shadow && typeof shadow === 'object') {
+    // golden_zone: Boroden ch.3 — quote fib golden zone (38.2-61.8) icinde
+    if (shadow.goldenZone?.inside && shadow.goldenZone.swingDir) {
+      const dir = shadow.goldenZone.swingDir === 'up' ? 'long'
+        : shadow.goldenZone.swingDir === 'down' ? 'short' : null;
+      if (dir) {
+        const wt = voteWeight('golden_zone');
+        if (wt > 0) {
+          votes.push({
+            source: 'golden_zone',
+            direction: dir,
+            weight: wt,
+            reasoning: `${shadow.goldenZone.tf || ''} golden zone icinde (shadow promoted)`,
+          });
+        }
+      }
+    }
+    // eq_liquidity: King p.50 — EQH/EQL likidite egilimi
+    if (shadow.liquidityBias && (shadow.liquidityBias === 'long' || shadow.liquidityBias === 'short')) {
+      const wt = voteWeight('eq_liquidity');
+      if (wt > 0) {
+        votes.push({
+          source: 'eq_liquidity',
+          direction: shadow.liquidityBias,
+          weight: wt,
+          reasoning: `EQH/EQL likidite egilimi ${shadow.liquidityBias} (shadow promoted)`,
+        });
+      }
+    }
+    // rsi_failure_swing: Wilder/Swanson — confirmed failure swing
+    if (shadow.rsiFailureSwing?.confirmed) {
+      const dir = shadow.rsiFailureSwing.type === 'bullish' ? 'long'
+        : shadow.rsiFailureSwing.type === 'bearish' ? 'short' : null;
+      if (dir) {
+        const wt = voteWeight('rsi_failure_swing');
+        if (wt > 0) {
+          votes.push({
+            source: 'rsi_failure_swing',
+            direction: dir,
+            weight: wt,
+            reasoning: `RSI failure swing ${shadow.rsiFailureSwing.type} (shadow promoted)`,
+          });
+        }
+      }
+    }
+  }
 
   return votes;
 }
@@ -891,7 +980,7 @@ export function gradeShortTermSignal({
   result.volTier = getVolTier(symbol);
 
   // Collect votes from ALL indicators (KhanSaab yoklugunda yatay modda)
-  const votes = collectVotes({ khanSaab: khanSaabForVotes, smc, studyValues, ohlcv, formation, squeeze, divergence, cdv, macroFilter, stochRSI, regime, symbol });
+  const votes = collectVotes({ khanSaab: khanSaabForVotes, smc, studyValues, ohlcv, formation, squeeze, divergence, cdv, macroFilter, stochRSI, regime, symbol, shadow });
   result.regime = regime || null;
 
   // --- Volume Reaction setup (CLAUDE.md: hacimli bar uclarinda kontra tepki) ---
@@ -1082,13 +1171,20 @@ export function gradeShortTermSignal({
         if (tally.direction === 'short' && reg === 'trend_up') oppositeTFs.push(tf);
       }
       if (oppositeTFs.length === 1) {
-        const mtfDowngrade = { 'A': 'B', 'B': 'C', 'C': 'BEKLE', 'BEKLE': 'BEKLE', 'IPTAL': 'IPTAL' };
-        const before = grade;
-        grade = mtfDowngrade[grade] || grade;
-        if (before !== grade) {
-          result.warnings.push(`MTF celiski: ${oppositeTFs[0]} ters trend — ${before} → ${grade}`);
-        }
         result.mtfConflict = { oppositeTFs };
+        // 2026-05-21: Yuksek conviction'da (>= A_min) tek-TF ters trend vetosunu
+        // BYPASS et. Backtest: MTF counter-trend kohortu BEKLE'de %68 WR ile
+        // kazaniyordu — guclu oylama tek HTF celiskisi yuzunden gereksiz dusuruluyordu.
+        if (tally.conviction >= A_min) {
+          result.warnings.push(`MTF celiski: ${oppositeTFs[0]} ters trend — yuksek conviction (${tally.conviction} >= ${A_min.toFixed(1)}) nedeniyle veto BYPASS`);
+        } else {
+          const mtfDowngrade = { 'A': 'B', 'B': 'C', 'C': 'BEKLE', 'BEKLE': 'BEKLE', 'IPTAL': 'IPTAL' };
+          const before = grade;
+          grade = mtfDowngrade[grade] || grade;
+          if (before !== grade) {
+            result.warnings.push(`MTF celiski: ${oppositeTFs[0]} ters trend — ${before} → ${grade}`);
+          }
+        }
       }
     }
   } catch (err) {
@@ -1104,6 +1200,16 @@ export function gradeShortTermSignal({
     if (before !== grade) {
       result.warnings.push(`Volume Reaction: SMC zone teyidi yok — ${before} → ${grade}`);
     }
+  }
+
+  // --- Conviction 4-6 bandi C tabani (2026-05-21) ---
+  // Backtest: ham conviction [4,6) bandindaki reddedilen sinyaller %78.5 WR ile
+  // kazaniyordu (virtual-alpha-inversion'in en guclu tekil kaynagi). Bu banttaki
+  // sinyalleri BEKLE yerine en az C kabul ediyoruz; downgrade'lerden SONRA floor
+  // olarak uygulanir. Ladder-engine yine de sembol/grade bazli ligi dusurebilir.
+  if (tally.conviction >= 4 && tally.conviction < 6 && (grade === 'BEKLE')) {
+    result.warnings.push(`Conviction 4-6 floor: ${tally.conviction} — BEKLE → C (backtest %78.5 WR kohortu)`);
+    grade = 'C';
   }
 
   // --- TF reliability downgrade DEVRE DISI (2026-04-20) ---
@@ -1178,13 +1284,24 @@ export function gradeShortTermSignal({
     // Momentum Market-Entry bypass: guclu trend + yuksek skor varsa pullback
     // beklemeden anlik fiyattan gir — aksi halde hareket kacirilir.
     // Koşul: ADX >= 28 VE (yön skoru >= %71 VEYA MTF guclu uyum)
+    //        VE ADX dususte DEGIL VE ADX asiri uzamis (>50) DEGIL.
     // Faz 2 v2.0: ADX>=28 zaten "trending" rejim demek; wrapper rejim-aware
     // ağırlıklandırma yaptıgı icin bull/bearScore burada direkt kullanilabilir.
+    // ADX-slope hizalama: dusen ADX trend momentum kaybi demek — market-entry'de
+    // tepeden/dipten girme riski yuksek; bypass kapatilir, smart-entry pullback arar.
     const _dirScore = tally.direction === 'long' ? (khanSaab?.bullScore || 0) : (khanSaab?.bearScore || 0);
     const _mtfStrong = !!(result.mtfConfirmation && result.mtfConfirmation.confidence >= 85
       && result.mtfConfirmation.direction === tally.direction);
     const _adxStrong = (adxVal || 0) >= 28;
-    const momentumMarket = _adxStrong && (_dirScore >= 71 || _mtfStrong);
+    const _adxFalling = khanSaab?.adxDirection === 'falling';
+    const _adxOverext = (adxVal || 0) > 50;
+    const _momentumQualifies = _adxStrong && (_dirScore >= 71 || _mtfStrong);
+    const momentumMarket = _momentumQualifies && !_adxFalling && !_adxOverext;
+    if (_momentumQualifies && _adxFalling) {
+      result.reasoning.push(`Momentum bypass iptal — ADX ${(adxVal || 0).toFixed(1)} dususte (momentum kaybi), smart-entry pullback arar`);
+    } else if (_momentumQualifies && _adxOverext) {
+      result.reasoning.push(`Momentum bypass iptal — ADX ${(adxVal || 0).toFixed(1)} asiri uzamis (>50), tepeden giris riski`);
+    }
 
     // Pump-top / dip-short guard: hacimli yesil mum tepesinde long veya
     // hacimli kirmizi mum dibinde short uretmeyi engelle. Tespit edilirse
@@ -1207,6 +1324,20 @@ export function gradeShortTermSignal({
             (_mtfStrong ? `, MTF uyum %${result.mtfConfirmation.confidence}` : '') +
             ' — pullback beklenmedi'
         ],
+        diagnostics: {
+          selectedEntrySource: 'quote_price',
+          entryRejectReason: 'MOMENTUM_BYPASS',
+          obCount: parsedBoxes?.orderBlocks?.length || 0,
+          fvgCount: parsedBoxes?.fvgZones?.length || 0,
+          correctSideObCount: null,
+          nearestCorrectSideObDistanceAtr: null,
+          nearestWrongSideObDistanceAtr: null,
+          insideOb: null,
+          insideObZone: null,
+          obMitigationStatus: null,
+          fvgAvailable: null,
+          khansaabAvailable: null,
+        },
       };
     } else {
       if (momentumMarket && pump.isPumpTop) {
@@ -1217,6 +1348,8 @@ export function gradeShortTermSignal({
         currentPrice,
         atr,
         parsedBoxes: parsedBoxes || null,
+        // Telemetri: OB mitigation durumu icin tagMitigation ciktisi
+        mitigatedBoxes: shadow?.mitigatedZones || null,
         // Faz 2 v2.0: KhanSaab label entry'si rejim filtresi olmadan gecer;
         // wrapper'in rejim-aware oylama mantığı zaten kotu trending varsayimi
         // bastırıyor.
@@ -1243,6 +1376,11 @@ export function gradeShortTermSignal({
             entrySource: 'pump_pullback',
             entryZone: { high: Math.max(pump.spikeBar.open, pump.spikeBar.close), low: Math.min(pump.spikeBar.open, pump.spikeBar.close) },
             reasoning: [`Pump-top tespit edildi (${pump.severity}) — spike mumun govde ortasi (${pullbackTarget.toFixed(4)}) pullback hedefi olarak set edildi, BEKLE_PULLBACK durumuna gecer`],
+            diagnostics: {
+              ...(smartEntry.diagnostics || {}),
+              selectedEntrySource: 'pump_pullback',
+              entryRejectReason: 'PUMP_PULLBACK',
+            },
           };
           result.pendingPullback = {
             target: pullbackTarget,
@@ -1260,6 +1398,7 @@ export function gradeShortTermSignal({
     result.entrySource = smartEntry.entrySource;
     result.entryZone = smartEntry.entryZone;
     result.entryReasoning = smartEntry.reasoning;
+    result.smartEntryDiagnostics = smartEntry.diagnostics || null;
     result.quotePrice = currentPrice;
 
     // Compute effective SL multiplier: base regime × category × TF adjustments
@@ -1277,7 +1416,7 @@ export function gradeShortTermSignal({
       // volRegime is the OBJECT returned by getVolatilityRegime ({regime, slMultiplier, ...}).
       // Map the regime name to the {low, normal, high} buckets used by per-symbol overrides.
       const regimeName = volRegime?.regime || null;
-      const volBucket = regimeName === 'STRONG_TREND' ? 'high'
+      const volBucket = (regimeName === 'STRONG_TREND' || regimeName === 'OVEREXTENDED') ? 'high'
                       : regimeName === 'RANGE'        ? 'low'
                       :                                 'normal';
       symSLMult = volBucket === 'high' ? (rule.high ?? null)
@@ -1374,6 +1513,10 @@ export function gradeShortTermSignal({
       result.entry = entryPrice;
       result.entrySource = 'quote_price';
       result.entryReasoning = ['Entry OB SL otesinde, anlik fiyata geri donuldu'];
+      if (result.smartEntryDiagnostics) {
+        result.smartEntryDiagnostics.selectedEntrySource = 'quote_price';
+        result.smartEntryDiagnostics.entryRejectReason = 'OB_SL_FALLBACK';
+      }
       // Fallback: OB tabanli SL artik gecersiz, sadece ATR bazli SL kullan.
       finalSL = Math.max(atrSL, entryPrice * minSLPct);
       slSource = 'atr_based';
@@ -1451,12 +1594,25 @@ export function gradeShortTermSignal({
       }
     }
 
+    // HTF bariyer cap'i (normal/zorla) TP'leri kisalttiysa true — minRR IPTAL
+    // esigi bu sinyaller icin 1.3'e dusurulur (cap kaynakli R:R dususu yuzunden
+    // 1:1.3 ustu sinyaller sirf minRR'a takilip iptal olmasin).
+    let barrierCapApplied = false;
+
     // --- Alignment Filters: SL ↔ OB catismasi + HTF Fibonacci hizalama ---
     // TP/SL set edildikten sonra, R:R hesaplanmadan once uygulanir. Eger HTF
     // trend iki+ TF'de zit yondeyse sinyal IPTAL edilir. TP'ler HTF fib direnci/
     // desteginin otesine gecerse fib'in hemen onune capped. SL baska bir OB'nin
     // icinde/kenarindaysa OB disina tasinir.
     try {
+      // SMC-gated barrier cap: sinyalde tam yapısal kırılım (BOS + ChoCH, ikisi de
+      // sinyal yönünde) varsa, bariyer cap-reddi korunur — istatistik (137 cap-
+      // reddedilen sinyal) BOS+ChoCH'lu grubun WR %68, yapısız grubun %43 olduğunu
+      // gösterdi. Yapı yoksa cap zorla uygulanır + grade 1 kademe düşer.
+      const _hasSmcBos   = votes.some(v => v.source === 'smc_bos'   && v.direction === tally.direction);
+      const _hasSmcChoch = votes.some(v => v.source === 'smc_choch' && v.direction === tally.direction);
+      const hasFullSMC = _hasSmcBos && _hasSmcChoch;
+
       const align = applyAlignmentFilters({
         symbol,
         direction: tally.direction,
@@ -1470,6 +1626,7 @@ export function gradeShortTermSignal({
         srLines: Array.isArray(smcSRLines) ? smcSRLines : [],
         entryOBZone: smartEntry?.entryZone || null,
         currentTF: timeframe,
+        hasFullSMC,
       });
 
       if (align.rejected) {
@@ -1534,6 +1691,24 @@ export function gradeShortTermSignal({
       }
       if (align.entryZoneClass?.inZone) {
         result.entryZoneClass = align.entryZoneClass;
+      }
+      if (align.barrierCapApplied) barrierCapApplied = true;
+
+      // SMC-gated barrier cap: cap, R:R'ı boğacağı için reddedilecekken sinyalde
+      // tam yapısal kırılım (BOS+ChoCH) olmadığı için ZORLA uygulandıysa — bu
+      // yapısal olarak zayıf bir trade (duvar dibinden giriş). Grade 1 kademe düşür.
+      if (align.barrierCapForced && ['A', 'B', 'C'].includes(result.grade)) {
+        const _downMap = { A: 'B', B: 'C', C: 'BEKLE' };
+        const _oldGrade = result.grade;
+        result.grade = _downMap[_oldGrade];
+        const _posMap = { A: 100, B: 70, C: 50, BEKLE: 0, IPTAL: 0 };
+        let _league = 'virtual';
+        try { _league = resolveLeague(symbol, result.grade); }
+        catch { _league = (result.grade === 'A' || result.grade === 'B') ? 'real' : (result.grade === 'C' ? 'ara' : 'virtual'); }
+        result.league = _league;
+        result.position_pct = _league === 'real' ? (_posMap[result.grade] || 0) : 0;
+        if (result.grade === 'BEKLE') result.action = 'BEKLE';
+        result.reasoning.push(`HTF bariyer cap zorla uygulandı (BOS+ChoCH yapısı yok) → grade ${_oldGrade}→${result.grade}`);
       }
     } catch (e) {
       // Filter hatasi sinyali kirmasin — uyari olarak dusur.
@@ -1605,6 +1780,14 @@ export function gradeShortTermSignal({
     if (regimeContext?.regime && REGIME_GATES[regimeContext.regime]?.minRR != null) {
       minRR = REGIME_GATES[regimeContext.regime].minRR;
       minRRSource = `regime:${regimeContext.regime}`;
+    }
+    // HTF bariyer cap'i TP'leri kisalttiysa R:R kacinilmaz olarak dustu. Bu
+    // sinyaller sirf minRR (1.5/2.0/2.5) esigine takildi diye iptal olmasin —
+    // IPTAL tabani 1.3'e cekilir. R:R >= 1.3 ise sinyal ayakta kalir; 1.3 alti
+    // gercekten kotu trade olarak iptal edilir.
+    if (barrierCapApplied && minRR > 1.3) {
+      minRR = 1.3;
+      minRRSource += '+barrier_cap_floor_1.3';
     }
     if (risk > 0 && reward / risk < minRR) {
       result.warnings.push(`R:R ${result.rr} (hedef ${rrTargetLabel}) < 1:${minRR} minimum (${minRRSource})`);
@@ -1861,111 +2044,125 @@ export function gradeLongTermSignal({ studyValues, ohlcv, formation, symbol, tim
  * Calculate the ideal entry price based on signal context (SMC zones, KhanSaab ENTRY).
  * Instead of blindly using lastBar.close, finds the best pullback zone for entry.
  */
-function calculateSmartEntry({ direction, currentPrice, atr, parsedBoxes, khanSaabEntry }) {
+// Mitigation durumunu zone yuksek/dusuk eslesmesiyle bul. mitigatedBoxes,
+// scanner-engine'in tagMitigation() ciktisi ({...zone, mitigated, mitigatedAt}).
+function lookupMitigation(zone, mitigatedList) {
+  if (!zone || !Array.isArray(mitigatedList) || !mitigatedList.length) return 'unknown';
+  const m = mitigatedList.find(z => z.high === zone.high && z.low === zone.low);
+  if (!m || typeof m.mitigated !== 'boolean') return 'unknown';
+  return m.mitigated ? 'mitigated' : 'fresh';
+}
+
+function calculateSmartEntry({ direction, currentPrice, atr, parsedBoxes, khanSaabEntry, mitigatedBoxes = null }) {
+  const diagnostics = {
+    selectedEntrySource: 'quote_price',
+    entryRejectReason: null,
+    obCount: parsedBoxes?.orderBlocks?.length || 0,
+    fvgCount: parsedBoxes?.fvgZones?.length || 0,
+    correctSideObCount: 0,
+    nearestCorrectSideObDistanceAtr: null,
+    nearestWrongSideObDistanceAtr: null,
+    insideOb: false,
+    insideObZone: null,
+    obMitigationStatus: null,
+    fvgAvailable: false,
+    khansaabAvailable: false,
+  };
   const result = {
     entry: currentPrice,
     entrySource: 'quote_price',
     entryZone: null,
     reasoning: [],
+    diagnostics,
   };
 
-  if (!currentPrice || !atr || atr <= 0) return result;
+  if (!currentPrice || !atr || atr <= 0) {
+    diagnostics.entryRejectReason = 'NO_PRICE_OR_ATR';
+    return result;
+  }
 
   const maxPullbackDistance = atr * 2.0; // Don't look for zones beyond 2 ATR
+  const isLong = direction === 'long';
+  if (!isLong && direction !== 'short') {
+    diagnostics.entryRejectReason = 'NO_DIRECTION';
+    return result;
+  }
 
-  if (direction === 'long') {
-    // Look for bullish OB below current price (pullback to institutional buy zone)
-    let bestOB = null;
-    if (parsedBoxes?.orderBlocks?.length) {
-      for (const ob of parsedBoxes.orderBlocks) {
-        if (ob.high < currentPrice && (currentPrice - ob.high) <= maxPullbackDistance) {
-          if (!bestOB || ob.high > bestOB.high) bestOB = ob; // Nearest OB below
-        }
-      }
+  const obs = parsedBoxes?.orderBlocks || [];
+  const mitList = mitigatedBoxes?.orderBlocks || null;
+
+  // OB siniflandirma: dogru-taraf (pullback hedefi), yanlis-taraf, icinde.
+  let bestOB = null, bestCorrectDist = Infinity, bestWrongDist = Infinity;
+  for (const ob of obs) {
+    if (currentPrice >= ob.low && currentPrice <= ob.high) {
+      // Fiyat OB bandi icinde — shadow-track, gercek girisi degistirmez.
+      if (!diagnostics.insideOb) { diagnostics.insideOb = true; diagnostics.insideObZone = ob; }
+      continue;
     }
-
-    // Look for FVG below current price (gap fill zone)
-    let bestFVG = null;
-    if (parsedBoxes?.fvgZones?.length) {
-      for (const fvg of parsedBoxes.fvgZones) {
-        if (fvg.high < currentPrice && (currentPrice - fvg.high) <= maxPullbackDistance) {
-          if (!bestFVG || fvg.high > bestFVG.high) bestFVG = fvg; // Nearest FVG below
-        }
+    const correctSide = isLong ? ob.high < currentPrice : ob.low > currentPrice;
+    const edge = isLong ? ob.high : ob.low;
+    const dist = Math.abs(currentPrice - edge);
+    if (correctSide) {
+      diagnostics.correctSideObCount++;
+      if (dist < bestCorrectDist) bestCorrectDist = dist;
+      if (dist <= maxPullbackDistance) {
+        // En yakin dogru-taraf OB (long: en yuksek high, short: en dusuk low)
+        if (!bestOB || (isLong ? ob.high > bestOB.high : ob.low < bestOB.low)) bestOB = ob;
       }
+    } else if (dist < bestWrongDist) {
+      bestWrongDist = dist;
     }
+  }
+  if (bestCorrectDist !== Infinity) diagnostics.nearestCorrectSideObDistanceAtr = bestCorrectDist / atr;
+  if (bestWrongDist !== Infinity) diagnostics.nearestWrongSideObDistanceAtr = bestWrongDist / atr;
 
-    // KhanSaab ENTRY label below current price
-    let ksEntry = null;
-    if (khanSaabEntry && khanSaabEntry > 0 && khanSaabEntry < currentPrice
-        && (currentPrice - khanSaabEntry) <= maxPullbackDistance) {
+  // FVG: dogru tarafta, pencere icinde
+  let bestFVG = null;
+  for (const fvg of (parsedBoxes?.fvgZones || [])) {
+    const correctSide = isLong ? fvg.high < currentPrice : fvg.low > currentPrice;
+    if (!correctSide) continue;
+    const edge = isLong ? fvg.high : fvg.low;
+    if (Math.abs(currentPrice - edge) > maxPullbackDistance) continue;
+    diagnostics.fvgAvailable = true;
+    if (!bestFVG || (isLong ? fvg.high > bestFVG.high : fvg.low < bestFVG.low)) bestFVG = fvg;
+  }
+
+  // KhanSaab ENTRY etiketi
+  let ksEntry = null;
+  if (khanSaabEntry && khanSaabEntry > 0) {
+    const correctSide = isLong ? khanSaabEntry < currentPrice : khanSaabEntry > currentPrice;
+    if (correctSide && Math.abs(currentPrice - khanSaabEntry) <= maxPullbackDistance) {
       ksEntry = khanSaabEntry;
-    }
-
-    // Priority: OB > FVG > KhanSaab ENTRY > quote price
-    if (bestOB) {
-      result.entry = bestOB.high;
-      result.entrySource = 'smc_ob';
-      result.entryZone = bestOB;
-      result.reasoning.push(`Bullish OB zonu (${bestOB.low.toFixed(2)}-${bestOB.high.toFixed(2)}), pullback bekleniyor`);
-    } else if (bestFVG) {
-      result.entry = bestFVG.high;
-      result.entrySource = 'smc_fvg';
-      result.entryZone = bestFVG;
-      result.reasoning.push(`FVG zonu (${bestFVG.low.toFixed(2)}-${bestFVG.high.toFixed(2)}), gap dolumu bekleniyor`);
-    } else if (ksEntry) {
-      result.entry = ksEntry;
-      result.entrySource = 'khansaab_entry';
-      result.reasoning.push(`KhanSaab ENTRY etiketi (${ksEntry.toFixed(2)})`);
-    } else {
-      result.reasoning.push(`Pullback bolgesi bulunamadi, anlik fiyat kullaniliyor (${currentPrice.toFixed(2)})`);
-    }
-  } else if (direction === 'short') {
-    // Look for bearish OB above current price
-    let bestOB = null;
-    if (parsedBoxes?.orderBlocks?.length) {
-      for (const ob of parsedBoxes.orderBlocks) {
-        if (ob.low > currentPrice && (ob.low - currentPrice) <= maxPullbackDistance) {
-          if (!bestOB || ob.low < bestOB.low) bestOB = ob; // Nearest OB above
-        }
-      }
-    }
-
-    // Look for FVG above current price
-    let bestFVG = null;
-    if (parsedBoxes?.fvgZones?.length) {
-      for (const fvg of parsedBoxes.fvgZones) {
-        if (fvg.low > currentPrice && (fvg.low - currentPrice) <= maxPullbackDistance) {
-          if (!bestFVG || fvg.low < bestFVG.low) bestFVG = fvg; // Nearest FVG above
-        }
-      }
-    }
-
-    // KhanSaab ENTRY label above current price
-    let ksEntry = null;
-    if (khanSaabEntry && khanSaabEntry > 0 && khanSaabEntry > currentPrice
-        && (khanSaabEntry - currentPrice) <= maxPullbackDistance) {
-      ksEntry = khanSaabEntry;
-    }
-
-    if (bestOB) {
-      result.entry = bestOB.low;
-      result.entrySource = 'smc_ob';
-      result.entryZone = bestOB;
-      result.reasoning.push(`Bearish OB zonu (${bestOB.low.toFixed(2)}-${bestOB.high.toFixed(2)}), pullback bekleniyor`);
-    } else if (bestFVG) {
-      result.entry = bestFVG.low;
-      result.entrySource = 'smc_fvg';
-      result.entryZone = bestFVG;
-      result.reasoning.push(`FVG zonu (${bestFVG.low.toFixed(2)}-${bestFVG.high.toFixed(2)}), gap dolumu bekleniyor`);
-    } else if (ksEntry) {
-      result.entry = ksEntry;
-      result.entrySource = 'khansaab_entry';
-      result.reasoning.push(`KhanSaab ENTRY etiketi (${ksEntry.toFixed(2)})`);
-    } else {
-      result.reasoning.push(`Pullback bolgesi bulunamadi, anlik fiyat kullaniliyor (${currentPrice.toFixed(2)})`);
+      diagnostics.khansaabAvailable = true;
     }
   }
 
+  // Oncelik: OB > FVG > KhanSaab ENTRY > quote price
+  if (bestOB) {
+    result.entry = isLong ? bestOB.high : bestOB.low;
+    result.entrySource = 'smc_ob';
+    result.entryZone = bestOB;
+    diagnostics.obMitigationStatus = lookupMitigation(bestOB, mitList);
+    result.reasoning.push(`${isLong ? 'Bullish' : 'Bearish'} OB zonu (${bestOB.low.toFixed(2)}-${bestOB.high.toFixed(2)}), pullback bekleniyor`);
+  } else if (bestFVG) {
+    result.entry = isLong ? bestFVG.high : bestFVG.low;
+    result.entrySource = 'smc_fvg';
+    result.entryZone = bestFVG;
+    result.reasoning.push(`FVG zonu (${bestFVG.low.toFixed(2)}-${bestFVG.high.toFixed(2)}), gap dolumu bekleniyor`);
+  } else if (ksEntry) {
+    result.entry = ksEntry;
+    result.entrySource = 'khansaab_entry';
+    result.reasoning.push(`KhanSaab ENTRY etiketi (${ksEntry.toFixed(2)})`);
+  } else {
+    // quote_price fallback — neden? telemetri icin siniflandir.
+    if (diagnostics.obCount === 0) diagnostics.entryRejectReason = 'NO_OB_BOX';
+    else if (diagnostics.correctSideObCount === 0) {
+      diagnostics.entryRejectReason = diagnostics.insideOb ? 'INSIDE_OB_IGNORED' : 'WRONG_SIDE_OB';
+    } else diagnostics.entryRejectReason = 'OB_TOO_FAR';
+    result.reasoning.push(`Pullback bolgesi bulunamadi, anlik fiyat kullaniliyor (${currentPrice.toFixed(2)})`);
+  }
+
+  diagnostics.selectedEntrySource = result.entrySource;
   return result;
 }
 

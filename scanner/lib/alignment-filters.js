@@ -116,115 +116,6 @@ export function resolveSLOBConflict({ sl, direction, atr, orderBlocks, entryOBZo
 }
 
 /**
- * SMC indikatorunun cizdigi yatay destek/direnc cizgilerine gore SL ve TP hizalamasi.
- *   - Long: SL altindaki en yakin S/R cizgisinin ALTINA itilir (0.2×ATR buffer),
- *           TP ustundeki en yakin S/R cizgisinin ALTINA capped (0.1%).
- *   - Short: SL ustundeki en yakin S/R cizgisinin USTUNE itilir, TP altindaki
- *            en yakin S/R cizgisinin USTUNE capped.
- * Bu, OB'den farkli olarak cift-taraflı (lines kurumsal swing pivotlarını isaretler;
- * SL onun icine koyulursa stop-av riski yuksektir).
- *
- * @param {object} opts
- * @param {'long'|'short'} opts.direction
- * @param {number} opts.entry
- * @param {number} opts.sl
- * @param {number|null} opts.tp1
- * @param {number|null} opts.tp2
- * @param {number|null} opts.tp3
- * @param {number} opts.atr
- * @param {Array<number>} opts.srLines — SMC yatay seviyeler (sirali onemsiz)
- * @returns {{
- *   sl:number, slMoved:boolean, slReason?:string,
- *   tp1:number|null, tp2:number|null, tp3:number|null,
- *   warnings:string[]
- * }}
- */
-export function applySMCLinesGuards({ direction, entry, sl, tp1, tp2, tp3, atr, srLines }) {
-  const warnings = [];
-  if (!Array.isArray(srLines) || srLines.length === 0 || !atr || atr <= 0 || !entry || entry <= 0) {
-    return { sl, slMoved: false, tp1, tp2, tp3, warnings };
-  }
-
-  // Entry yakinindaki line'lari filtrele — %10'dan uzaklari yoksay (noise).
-  // Ayrica entry'ye COK yakin (kucuk swing/BOS/CHoCH yapi cizgileri) de noise:
-  // min mesafe = max(1×ATR, %1.5×entry). Bu esik altindaki cizgiler gercek
-  // direnc/destek degil, intrabar yapi isaretleri — TP/SL'ye etki etmemeli.
-  const minDist = Math.max(atr * 1.0, entry * 0.015);
-  const relevant = srLines.filter(p =>
-    Math.abs(p - entry) / entry < 0.10
-    && Math.abs(p - entry) >= minDist
-  );
-  if (relevant.length === 0) return { sl, slMoved: false, tp1, tp2, tp3, warnings };
-
-  const below = relevant.filter(p => p < entry).sort((a, b) => b - a); // en yakin ilk
-  const above = relevant.filter(p => p > entry).sort((a, b) => a - b);
-  const buffer = atr * 0.2;
-
-  let outSL = sl;
-  let slMoved = false;
-  let slReason = null;
-
-  if (direction === 'long') {
-    // SL entry altinda olmali; bir S/R cizgisi SL ile entry arasinda ise
-    // veya SL cizgiye cok yakinsa, cizginin altina it.
-    for (const p of below) {
-      if (p > outSL - 1e-9 && p < entry) {
-        const moved = p - buffer;
-        if (moved < outSL) {
-          outSL = moved;
-          slMoved = true;
-          slReason = `SL SMC S/R cizgisi @ ${p.toFixed(4)} icinde — altina itildi: ${outSL.toFixed(4)}`;
-          break;
-        }
-      }
-    }
-  } else {
-    for (const p of above) {
-      if (p < outSL + 1e-9 && p > entry) {
-        const moved = p + buffer;
-        if (moved > outSL) {
-          outSL = moved;
-          slMoved = true;
-          slReason = `SL SMC S/R cizgisi @ ${p.toFixed(4)} icinde — ustune itildi: ${outSL.toFixed(4)}`;
-          break;
-        }
-      }
-    }
-  }
-
-  // TP capping: TP bir cizgiyi gecmesin (cizginin ONUNDEN al).
-  const capTP = (tp) => {
-    if (tp == null) return tp;
-    if (direction === 'long') {
-      const nearest = above[0];
-      if (nearest && tp >= nearest) {
-        const capped = nearest * 0.999;
-        warnings.push(`TP ${tp.toFixed(4)} SMC direncini (@${nearest.toFixed(4)}) astigi icin capped → ${capped.toFixed(4)}`);
-        return capped;
-      }
-    } else {
-      const nearest = below[0];
-      if (nearest && tp <= nearest) {
-        const capped = nearest * 1.001;
-        warnings.push(`TP ${tp.toFixed(4)} SMC destegini (@${nearest.toFixed(4)}) astigi icin capped → ${capped.toFixed(4)}`);
-        return capped;
-      }
-    }
-    return tp;
-  };
-
-  return {
-    sl: outSL,
-    slMoved,
-    slReason,
-    tp1: capTP(tp1),
-    tp2: capTP(tp2),
-    tp3: capTP(tp3),
-    warnings,
-  };
-}
-
-/**
  * HTF fib seviyeleri SL icin de bir duvar olsun: SL entry'nin yanlis tarafinda
  * bir HTF fib yapisi tarafindan delinmeden yerlesmeli. Ornegin:
  *   - Long: SL entry altinda olmali; entry ile SL arasinda bir HTF fib destegi
@@ -400,12 +291,19 @@ export function enforceHTFFibAlignment({ symbol, direction, entry, sl, tp1, tp2,
 export function applyAlignmentFilters({
   symbol, direction, entry, sl, tp1, tp2, tp3,
   atr, smc, srLines, entryOBZone, currentTF,
+  hasFullSMC = false,
 }) {
   const warnings = [];
   const reasons = [];
   let adjustedSL = sl;
   let adjTP1 = tp1, adjTP2 = tp2, adjTP3 = tp3;
   let slMoved = false;
+  // Bariyer cap'i, R:R'i bogacagi icin reddedilecekken SMC yapisi (BOS+ChoCH)
+  // olmadigi icin ZORLA uygulandiysa true olur — grader sinyali 1 kademe duser.
+  let barrierCapForced = false;
+  // Bariyer cap'i (normal VEYA zorla) TP'leri gercekten kisalttiysa true olur —
+  // grader minRR IPTAL esigini bu sinyaller icin 1.3'e dusurur (R:R>=1.3 ayakta kalir).
+  let barrierCapApplied = false;
 
   // 1) SL ↔ OB catismasi
   if (smc?.orderBlocks) {
@@ -489,16 +387,8 @@ export function applyAlignmentFilters({
     const fibBasis = formatBarrierFibBasis(majorZone);
     const fibBasisText = fibBasis ? ` | Fib dayanak: ${fibBasis}` : '';
 
-    // Aşama A — bariyer min-distance kuralı (geçici köprü, Faz 4'te
-    // unified-levels.js ile yerini alacak).
-    const refuseCheck = shouldRefuseBarrierCap({ entry, sl: adjustedSL, capped, direction });
-
-    if (refuseCheck.refused) {
-      const reasonText = refuseCheck.reason === 'wrong_side'
-        ? `cap kâr tarafında değil: entry ${entry.toFixed(4)}, cap ${capped.toFixed(4)}, yön ${direction.toUpperCase()}`
-        : `bariyer (${majorZone.tf} @ ${majorZone.price.toFixed(4)}) çok yakın: cap mesafesi ${refuseCheck.cappedDist.toFixed(4)} < min ${refuseCheck.minTpDist.toFixed(4)} (1.3×SL)`;
-      warnings.push(`[HTF-Barrier] Cap REDDEDILDI — ${reasonText}. Orijinal TP'ler korundu (Aşama A geçici kural, Faz 4 unified-levels öncesi).${fibBasisText}`);
-    } else {
+    // TP cap helper — bariyeri asan TP'leri seviyenin onune ceker.
+    const applyCap = () => {
       const cap = (tp) => {
         if (tp == null) return tp;
         const crossed = direction === 'long' ? tp >= majorZone.price : tp <= majorZone.price;
@@ -506,10 +396,39 @@ export function applyAlignmentFilters({
       };
       const tp1New = cap(adjTP1), tp2New = cap(adjTP2), tp3New = cap(adjTP3);
       const anyChanged = tp1New !== adjTP1 || tp2New !== adjTP2 || tp3New !== adjTP3;
-      if (anyChanged) {
+      adjTP1 = tp1New; adjTP2 = tp2New; adjTP3 = tp3New;
+      return anyChanged;
+    };
+
+    // Aşama A — bariyer min-distance kuralı (geçici köprü, Faz 4'te
+    // unified-levels.js ile yerini alacak).
+    const refuseCheck = shouldRefuseBarrierCap({ entry, sl: adjustedSL, capped, direction });
+
+    if (refuseCheck.refused) {
+      if (refuseCheck.reason === 'wrong_side') {
+        // Cap kâr tarafında değil — uygulanamaz, orijinal TP korunur.
+        warnings.push(`[HTF-Barrier] Cap REDDEDILDI — cap kâr tarafında değil: entry ${entry.toFixed(4)}, cap ${capped.toFixed(4)}, yön ${direction.toUpperCase()}.${fibBasisText}`);
+      } else if (hasFullSMC) {
+        // SMC-gated refusal: bariyer yakın (cap R:R'ı boğardı) AMA sinyalde tam
+        // yapısal kırılım (BOS + ChoCH, yönde) var. İstatistik (137 cap-reddedilen
+        // sinyal): BOS+ChoCH'lu grup WR %68, yapısız grup WR %43. Tam yapı duvarı
+        // kırma olasılığını gösterdiği için refusal KORUNUR, uzak TP'ler kalır.
+        warnings.push(`[HTF-Barrier] Cap REDDEDILDI — bariyer (${majorZone.tf} @ ${majorZone.price.toFixed(4)}) yakın ama BOS+ChoCH tam yapısal kırılım mevcut → refusal korundu, orijinal TP'ler tutuldu.${fibBasisText}`);
+      } else {
+        // SMC-gated refusal reddedildi: bariyer yakın VE tam yapısal kırılım YOK.
+        // İstatistiksel olarak duvardan dönüp SL'e gitme riski yüksek (WR %43).
+        // Cap ZORLA uygulanır + grader sinyali 1 kademe düşürür (barrierCapForced).
+        const changed = applyCap();
+        barrierCapForced = true;
+        if (changed) barrierCapApplied = true;
+        warnings.push(`[HTF-Barrier] Cap ZORLA UYGULANDI — bariyer (${majorZone.tf} @ ${majorZone.price.toFixed(4)}) yakın, BOS+ChoCH tam yapısı YOK → duvardan dönüş riski yüksek; TP'ler cap'lendi${changed ? ` → ${capped.toFixed(4)}` : ''}, grade 1 kademe düşürülecek.${fibBasisText}`);
+      }
+    } else {
+      const changed = applyCap();
+      if (changed) {
+        barrierCapApplied = true;
         warnings.push(`[HTF-Barrier] TP'ler onemli HTF ${majorZone.sources.join('+')} seviyesinin (${majorZone.tf} @ ${majorZone.price.toFixed(4)}, strength=${majorZone.strength}) onune cekildi → ${capped.toFixed(4)}${fibBasisText}`);
       }
-      adjTP1 = tp1New; adjTP2 = tp2New; adjTP3 = tp3New;
     }
   }
 
@@ -530,6 +449,8 @@ export function applyAlignmentFilters({
     rejected: false,
     reasons,
     warnings,
+    barrierCapForced,
+    barrierCapApplied,
     adjusted: {
       sl: adjustedSL,
       tp1: adjTP1,

@@ -433,7 +433,14 @@ export function getVolatilityRegime(adxValue) {
   const adx = parseFloat(adxValue);
   if (isNaN(adx)) return { regime: 'unknown', adx: null, slMultiplier: 2.5, strategy: 'Veri yok — varsayilan genis SL' };
 
-  if (adx > 35) {
+  if (adx > 50) {
+    return {
+      regime: 'OVEREXTENDED',
+      adx,
+      slMultiplier: 3.0,
+      strategy: 'Asiri uzama (ADX>50) — trend cok olgun, momentum kaybi / ters donus riski; yeni giris icin temkinli ol, kismi kar al',
+    };
+  } else if (adx > 35) {
     return {
       regime: 'STRONG_TREND',
       adx,
