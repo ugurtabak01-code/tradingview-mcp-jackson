@@ -1131,6 +1131,41 @@ function showDetail(s) {
     content.appendChild(rsBox);
   }
 
+  // Temel Analiz (sadece ABD hisseleri; bilgi amacli)
+  if (s.fundamentalSnapshot) {
+    var f = s.fundamentalSnapshot;
+    var stanceLabel = { positive: 'Pozitif', neutral: 'Notr', negative: 'Negatif', unknown: 'Bilinmiyor' };
+    var stanceColor = { positive: 'var(--green)', negative: 'var(--red)', neutral: 'var(--text2)', unknown: 'var(--text2)' };
+    var faHeader = el('div', {
+      textContent: 'Temel Analiz — ' + (stanceLabel[f.overall] || 'Bilinmiyor') + (f.freshness ? ' (' + f.freshness + ')' : '') + ' — tikla ac/kapat',
+      style: { marginTop: '10px', fontSize: '11px', color: stanceColor[f.overall] || 'var(--blue)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', userSelect: 'none' },
+    });
+    var faBox = el('div', { style: { display: 'none', marginTop: '4px' } });
+    if (f.asOf || f.fiscalPeriod) {
+      faBox.appendChild(el('div', {
+        textContent: (f.asOf ? 'asOf: ' + String(f.asOf).slice(0, 10) : '') + (f.fiscalPeriod ? ' · donem: ' + f.fiscalPeriod : ''),
+        style: { fontSize: '10px', color: 'var(--text2)', padding: '2px 0 4px' },
+      }));
+    }
+    (f.sections || []).forEach(function(sec) {
+      var col = stanceColor[sec.stance] || 'var(--text2)';
+      var row = el('div', { style: { display: 'flex', justifyContent: 'space-between', gap: '8px', padding: '2px 0', fontSize: '11px' } }, [
+        el('span', { textContent: sec.label, style: { color: 'var(--text)' } }),
+        el('strong', { textContent: stanceLabel[sec.stance] || 'Bilinmiyor', style: { color: col, minWidth: '70px', textAlign: 'right' } }),
+      ]);
+      faBox.appendChild(row);
+      if (sec.summary) {
+        faBox.appendChild(el('div', {
+          textContent: sec.summary,
+          style: { fontSize: '10px', color: 'var(--text2)', padding: '0 0 4px 4px', lineHeight: '1.4' },
+        }));
+      }
+    });
+    faHeader.onclick = function() { faBox.style.display = faBox.style.display === 'none' ? 'block' : 'none'; };
+    content.appendChild(faHeader);
+    content.appendChild(faBox);
+  }
+
   // Vote breakdown + tally
   if ((s.voteBreakdown && s.voteBreakdown.length) || s.tally) {
     var vbHeader = el('div', {

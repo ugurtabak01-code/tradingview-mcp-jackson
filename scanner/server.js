@@ -38,6 +38,10 @@ import { formatBarrierFibBasis } from './lib/alignment-filters.js';
 import { startLivePriceFeed, getLivePrice, getAllLivePrices, getFeedStats, getFeedHealth, registerSymbols as registerLiveSymbols } from './lib/live-price-feed.js';
 import { wrapBroadcast as wrapLiveOutcome } from './lib/learning/live-outcome-processor.js';
 import { startYahooPriceFeed, getAllYahooPrices, getYahooFeedStats, getYahooPrice, registerSymbolsByCategory as registerYahooByCategory, registerSymbols as registerYahooSymbols } from './lib/yahoo-price-feed.js';
+// Bug fix (2026-05-15): kayittaki fundamentalSnapshot stale (eski generic summary
+// metinleri) — dashboard endpoint'inde live re-classify yapip somut sayili
+// summary'leri her cagrida uretiyoruz. ABD-disi kategorilerde null doner.
+import { buildFundamentalSnapshot } from './lib/fundamental/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3838;
@@ -1095,6 +1099,18 @@ app.get('/api/signals/open-dashboard', (req, res) => {
         trailingStopLevel: s.trailingStopLevel || null,
         refreshCount: s.refreshCount || 0,
         lastRefreshedAt: s.lastRefreshedAt || null,
+        // Bug fix (2026-05-15): fundamentalSnapshot dashboard cagrisinda LIVE
+        // hesaplaniyor — storage'daki eski (generic summary'li) snapshot yerine
+        // her zaman taze stance-classifier ciktisi (somut sayilarla). ABD disi
+        // kategorilerde buildFundamentalSnapshot null doner.
+        fundamentalSnapshot: (() => {
+          try {
+            // Storage'da abd_hisse veya us_stock yazabilir; buildFundamental
+            // sadece 'abd_hisse' tanir, mapping yap.
+            const cat = (s.category === 'us_stock' || s.category === 'abd_hisse') ? 'abd_hisse' : s.category;
+            return buildFundamentalSnapshot({ symbol: s.symbol, category: cat });
+          } catch { return s.fundamentalSnapshot || null; }
+        })(),
       };
     });
 
@@ -1198,6 +1214,13 @@ app.get('/api/signals/closed-24h', (req, res) => {
       createdAt: s.createdAt,
       resolvedAt: s.resolvedAt || s.entryExpiredAt || null,
       holdingPeriodMinutes: s.holdingPeriodMinutes || null,
+      // Bug fix (2026-05-15): recent-signals endpoint'i icin de live re-classify.
+      fundamentalSnapshot: (() => {
+        try {
+          const cat = (s.category === 'us_stock' || s.category === 'abd_hisse') ? 'abd_hisse' : s.category;
+          return buildFundamentalSnapshot({ symbol: s.symbol, category: cat });
+        } catch { return s.fundamentalSnapshot || null; }
+      })(),
     }));
     // Outcome class özet
     const wins = enriched.filter(x => x.outcome === 'tp3_hit' || x.outcome === 'tp2_hit' || x.outcome === 'tp1_hit' || x.outcome === 'trailing_stop_exit').length;

@@ -795,6 +795,10 @@ export function recordSignal(scanResult) {
     // shadowMetrics is). No live decision path reads this field.
     shadowFeatures: scanResult.shadowFeatures || null,
 
+    // Fundamental snapshot (US equities only; null otherwise). Bilgi amacli;
+    // grade/votes/RR/yon kararlarina etki etmez.
+    fundamentalSnapshot: scanResult.fundamentalSnapshot || null,
+
     // REGIME_GATES kalibrasyonu icin instrumentation (2026-05-12).
     // htfConfidence per-TF gradeShortTermSignal sonucundan; mtfAlignment
     // scanner-engine bestSignal'e tum TF'ler tamamlandiktan sonra yaziyor.

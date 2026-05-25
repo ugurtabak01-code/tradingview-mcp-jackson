@@ -177,8 +177,37 @@ class ScanScheduler {
 
     // Start the rotation cycle — scans all categories sequentially then waits
     this._startRotationCycle();
+    // Daily US fundamentals sync (SEC EDGAR, no live-scan impact)
+    this._startDailyFundamentalsSync();
 
     console.log('[Scheduler] Baslatildi — TUM kategoriler taranacak (kripto, forex, abd_hisse, bist, emtia)');
+  }
+
+  /**
+   * ABD hisseleri icin temel analiz cache'ini gunde bir kez SEC EDGAR'dan tazele.
+   * SEC_USER_AGENT yoksa sessizce atla. Sinyal akisina etki etmez.
+   */
+  _startDailyFundamentalsSync() {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const run = async () => {
+      if (!process.env.SEC_USER_AGENT) {
+        console.log('[fundamental-sync] SEC_USER_AGENT yok — gunluk sync atlandi');
+        return;
+      }
+      try {
+        const { syncUsFundamentals } = await import('../scripts/sync-us-fundamentals.mjs');
+        const t0 = Date.now();
+        const res = await syncUsFundamentals({ fromWatchlist: 'abd_hisse' });
+        console.log(`[fundamental-sync] gunluk tamam: ${res.ok} ok, ${res.fail} fail (${Math.round((Date.now() - t0) / 1000)}s)`);
+      } catch (err) {
+        console.error(`[fundamental-sync] gunluk hata: ${err.message}`);
+      }
+    };
+    // Ilk calistirma 30sn sonra; sonra her 24 saatte.
+    // Bug fix: initial setTimeout da this.timers'a yazilmali — aksi halde
+    // stop() cagrildiktan sonra 30sn icinde gec tetiklenebiliyordu.
+    this.timers.fundamentalsSyncInit = setTimeout(run, 30 * 1000);
+    this.timers.fundamentalsSync = setInterval(run, DAY_MS);
   }
 
   /**
