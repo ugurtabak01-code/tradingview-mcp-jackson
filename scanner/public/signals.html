@@ -332,6 +332,7 @@
 
   <button class="btn btn-refresh" onclick="loadSignals()">Yenile</button>
   <button class="btn btn-refresh" onclick="window.location.href='/closed-24h.html'" style="background: #6c757d; color: #fff;">Son 24s Kapanan</button>
+  <button class="btn btn-refresh" onclick="window.location.href='/pnl-chart.html'" style="background: #58a6ff; color: #fff;">P&amp;L Grafik</button>
   <button class="btn btn-refresh" onclick="cleanupDuplicates()" style="background: #ff9800; color: #000;">Mukerrer Temizle</button>
 
   <div class="auto-refresh-indicator">
@@ -1113,22 +1114,84 @@ function showDetail(s) {
     });
   }
 
-  // Reasoning (sinyal acilma gerekceleri)
+  // Reasoning (sinyal acilma gerekceleri) — vote-iliskili satirlari OYLAMA
+  // blokuna birak; burada yalniz BAGLAM (HTF, barrier, rejim wrapper, MTF
+  // uyum, gate, per-symbol rule, vol tier) gosterilsin. Aksi halde MACD/EMA/
+  // SMC/CDV/ADX gibi vote satirlari iki yerde tekrarlanip karisikliga sebep
+  // oluyordu (2026-05-15 fix).
   if (s.reasoning && s.reasoning.length > 0) {
-    var rsHeader = el('div', {
-      textContent: 'Sinyal Gerekceleri (' + s.reasoning.length + ') — tikla ac/kapat',
-      style: { marginTop: '12px', fontSize: '11px', color: 'var(--blue)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', userSelect: 'none' },
+    // Vote-iliskili satirlari atmak icin pattern (insan-cümle olan ama
+    // yapisal voteBreakdown'da zaten gosterilen kaynaklarin acklimalari).
+    var VOTE_REASON_PATTERNS = [
+      /^MACD/, /^EMA Cross/, /^EMA \d+/, /^RSI \d/, /^RSI cross/, /^Stoch/i,
+      /^ADX \d/, /^DMI:/, /^SMC (BOS|CHoCH|OB|FVG):/i, /^CDV:/i,
+      /^Formasyon/i, /^Squeeze/i, /^Divergence/i, /^Volume (spike|reaction|confirm)/i,
+      /^Macro/i, /^VWAP/i, /^KhanSaab/, /^Liquidity Sweep/i,
+      /^Premium\/Discount/i, /^Golden zone/i, /^EQH\/EQL/i, /^RSI failure/i,
+      /^Oylama:/, /^---\s*Oylama:/, /^Vol tier/i,
+    ];
+    var contextLines = s.reasoning.filter(function(r) {
+      return !VOTE_REASON_PATTERNS.some(function(rx) { return rx.test(r); });
     });
-    var rsBox = el('div', { style: { display: 'none', marginTop: '4px' } });
-    s.reasoning.forEach(function(r) {
-      rsBox.appendChild(el('div', {
-        textContent: '• ' + r,
-        style: { fontSize: '11px', color: 'var(--text)', padding: '2px 0', lineHeight: '1.4' },
-      }));
+
+    // Bağlam'ı IKIYE ayır:
+    //  • IMPACT  → gerçekten karar mantığını değiştiren (HTF Level/Fib/Barrier
+    //             filter rejection+SL/TP move, HTF counter-trend conviction
+    //             kırpma, Rejim wrapper vote suppress/boost, Vol tier eşik ×).
+    //  • ADVISORY → 2026-05'te advisory yapılan (HTF GATE, MTF uyumu, per-symbol
+    //             rule, computeRegime newPositionAllowed): grade'e dokunmuyor,
+    //             sadece archive instrumentation icin yazılıyor.
+    var ADVISORY_PATTERNS = [
+      /^\s*HTF\s+GATE/i,
+      /^MTF uyumu /i,
+      /per-symbol rule/i,
+      /^\s*computeRegime/i,
+      /HTF counter-trend.*bilgi notu/i,  // "bilgi notu, BEKLE'ye dusurulmedi" - conviction zaten ust satirda kırpıldı
+      /advisory, BEKLE\'ye dusurulmedi/i,
+      /advisory, grade korundu/i,
+      /^\s*\[Trendline\]/i,  // Trendline advisory — grade/vote'a etki yok
+    ];
+    var impact = [], advisory = [];
+    contextLines.forEach(function(r) {
+      if (ADVISORY_PATTERNS.some(function(rx) { return rx.test(r); })) advisory.push(r);
+      else impact.push(r);
     });
-    rsHeader.onclick = function() { rsBox.style.display = rsBox.style.display === 'none' ? 'block' : 'none'; };
-    content.appendChild(rsHeader);
-    content.appendChild(rsBox);
+
+    if (impact.length > 0) {
+      var rsHeader = el('div', {
+        textContent: 'Baglam — Karari Etkileyen (' + impact.length + ') — tikla ac/kapat',
+        style: { marginTop: '12px', fontSize: '11px', color: 'var(--blue)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', userSelect: 'none' },
+        title: 'HTF Level filter (SL/TP/iptal), HTF counter-trend conviction kırpma, Rejim wrapper vote suppress, Vol tier esik carpani — bunlar grade veya entry/SL/TP hesabını degistirir',
+      });
+      var rsBox = el('div', { style: { display: 'none', marginTop: '4px' } });
+      impact.forEach(function(r) {
+        rsBox.appendChild(el('div', {
+          textContent: '• ' + r,
+          style: { fontSize: '11px', color: 'var(--text)', padding: '2px 0', lineHeight: '1.4' },
+        }));
+      });
+      rsHeader.onclick = function() { rsBox.style.display = rsBox.style.display === 'none' ? 'block' : 'none'; };
+      content.appendChild(rsHeader);
+      content.appendChild(rsBox);
+    }
+
+    if (advisory.length > 0) {
+      var avHeader = el('div', {
+        textContent: 'Izleme / Advisory (' + advisory.length + ') — grade etkisi yok — tikla ac/kapat',
+        style: { marginTop: '8px', fontSize: '10px', color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', userSelect: 'none' },
+        title: 'HTF GATE, MTF uyumu, per-symbol rule, computeRegime: 2026-05\'te advisory yapildi. Grade veya SL/TP\'ye dokunmaz, sadece arsive yazilir (ogrenme kalibrasyonu icin).',
+      });
+      var avBox = el('div', { style: { display: 'none', marginTop: '4px', opacity: 0.7 } });
+      advisory.forEach(function(r) {
+        avBox.appendChild(el('div', {
+          textContent: '◦ ' + r,
+          style: { fontSize: '10px', color: 'var(--text2)', padding: '1px 0', lineHeight: '1.4', fontStyle: 'italic' },
+        }));
+      });
+      avHeader.onclick = function() { avBox.style.display = avBox.style.display === 'none' ? 'block' : 'none'; };
+      content.appendChild(avHeader);
+      content.appendChild(avBox);
+    }
   }
 
   // Temel Analiz (sadece ABD hisseleri; bilgi amacli)
@@ -1179,24 +1242,34 @@ function showDetail(s) {
         style: { fontSize: '11px', color: 'var(--text2)', padding: '3px 0 6px' },
       }));
     }
+    // Shadow havuzdan live'a promote edilmis indikatorler (2026-05-15).
+    // Bu listeyi koruyacaksak signal-grader DEFAULT_VOTE_WEIGHTS ile esit
+    // tutun. Live oylamada normal kaynaklarla esit muamele gorur; sadece
+    // gorsel etiket ile farkindalik artirir.
+    var PROMOTED_SHADOW = { golden_zone: 1, eq_liquidity: 1, rsi_failure_swing: 1 };
     (s.voteBreakdown || []).forEach(function(v) {
       var dirCol = v.direction === 'long' ? 'var(--green)' : v.direction === 'short' ? 'var(--red)' : 'var(--text2)';
+      var isPromoted = !!PROMOTED_SHADOW[v.source];
       var line = (v.source || '?') + ' (' + (v.direction || 'amplifier') + ', w=' + (v.weight != null ? v.weight : '?') + ')';
-      vbBox.appendChild(el('div', { textContent: '• ' + line, style: { fontSize: '11px', color: dirCol, padding: '2px 0' } }));
+      var row = el('div', { style: { fontSize: '11px', color: dirCol, padding: '2px 0', display: 'flex', alignItems: 'center', gap: '6px' } });
+      row.appendChild(el('span', { textContent: '• ' + line }));
+      if (isPromoted) {
+        row.appendChild(el('span', {
+          textContent: 'shadow→live',
+          title: 'Shadow havuzdan canli oylamaya promote edildi (2026-05-15). Live indicator-scorer suredeginde olcumu yapiyor.',
+          style: { fontSize: '9px', padding: '1px 5px', borderRadius: '3px', background: 'var(--blue)', color: 'white', letterSpacing: '0.3px' },
+        }));
+      }
+      vbBox.appendChild(row);
     });
     vbHeader.onclick = function() { vbBox.style.display = vbBox.style.display === 'none' ? 'block' : 'none'; };
     content.appendChild(vbHeader);
     content.appendChild(vbBox);
   }
 
-  // Trendline detay paneli — capa/temas/wick-pierce/kirilim + plan adaylari +
-  // esikler + motor uyarilari. Advisory: grade'e etki yok.
-  // 2026-05-20 — pierced cizgi plan uretebilir (anlik wick trendi bozmaz).
-  if (s.trendlineContext && (
-    s.trendlineContext.support
-    || s.trendlineContext.resistance
-    || (s.trendlineContext.warnings && s.trendlineContext.warnings.length)
-  )) {
+  // Trendline — cizgiyi tanimlayan capa noktalari + tarihleri, temas noktalari,
+  // yukselen/dusen kategorizasyonu. Advisory: grade'e etki yok.
+  if (s.trendlineContext && (s.trendlineContext.support || s.trendlineContext.resistance)) {
     var tlDate = function(t) {
       if (t == null) return '?';
       var ms = Number(t) < 1e12 ? Number(t) * 1000 : Number(t);
@@ -1205,22 +1278,14 @@ function showDetail(s) {
         day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit',
       });
     };
-    // Codex ddc8f75 — 4 trendline tipi:
-    //   rising_support     : taban, pozitif egim   → yesil
-    //   falling_support    : taban, negatif egim   → yesil (yine taban, ama dusuyor)
-    //   falling_resistance : tavan, negatif egim   → kirmizi
-    //   rising_resistance  : tavan, pozitif egim   → kirmizi (yukselen tavan)
     var tlKindLabel = {
-      rising_support: 'Yukselen Destek',
-      falling_support: 'Dusen Destek',
-      falling_resistance: 'Dusen Direnc',
-      rising_resistance: 'Yukselen Direnc',
+      rising_support: 'Yukselen Destek', falling_resistance: 'Dusen Direnc',
+      rising_resistance: 'Yukselen Direnc', falling_support: 'Dusen Destek',
     };
+    // Renk rol'e gore: tavan (direnc) kirmizi, taban (destek) yesil — egimden bagimsiz.
     var tlKindColor = {
-      rising_support: 'var(--green)',
-      falling_support: 'var(--green)',
-      falling_resistance: 'var(--red)',
-      rising_resistance: 'var(--red)',
+      rising_support: 'var(--green)', falling_resistance: 'var(--red)',
+      rising_resistance: 'var(--red)', falling_support: 'var(--green)',
     };
 
     var tlHeader = el('div', {
@@ -1229,8 +1294,13 @@ function showDetail(s) {
     });
     var tlBox = el('div', { style: { display: 'none', marginTop: '4px' } });
 
+    // Guven %70 altindaki trendline'lar kartta gosterilmez — dusuk guvenli /
+    // stale cizgiler (or. ileriye uzatilip fiyattan kopmus) kullaniciyi
+    // yaniltmasin. Esik motorun da uyguladigi posterior reddine ek emniyet.
+    var TL_MIN_CONFIDENCE = 0.70;
     var renderTrendline = function(tl) {
       if (!tl) return;
+      if (!(typeof tl.confidence === 'number' && tl.confidence >= TL_MIN_CONFIDENCE)) return;
       var col = tlKindColor[tl.type] || 'var(--text2)';
       var statusBits = [];
       statusBits.push(tl.confirmed ? 'Onayli (' + tl.touchCount + ' temas)' : 'Aday (' + tl.touchCount + ' temas)');
@@ -1240,6 +1310,7 @@ function showDetail(s) {
         statusBits.push('Gecmiste kirildi (' + tl.recentCloseBreak.ageBars + ' bar once)');
       }
       if (tl.pierced) {
+        // posteriorPierceCount tam sayi, posteriorPierces slice(-5)'lik son N
         var pierceTotal = tl.posteriorPierceCount != null
           ? tl.posteriorPierceCount
           : (tl.posteriorPierces ? tl.posteriorPierces.length : '?');
@@ -1264,6 +1335,7 @@ function showDetail(s) {
         ]));
       });
 
+      // Capa noktalari — cizgiyi tanimlayan 2 pivot
       tlBox.appendChild(el('div', {
         textContent: 'Capa noktalari (cizgiyi tanimlar):',
         style: { fontSize: '10px', color: 'var(--text2)', padding: '4px 0 2px' },
@@ -1275,6 +1347,7 @@ function showDetail(s) {
         }));
       });
 
+      // Temas noktalari — cizgiye degen tum pivotlar
       if (tl.touches && tl.touches.length) {
         tlBox.appendChild(el('div', {
           textContent: 'Temas noktalari (' + tl.touches.length + '):',
@@ -1288,6 +1361,7 @@ function showDetail(s) {
         });
       }
 
+      // Wick pierce noktalari — P2 sonrasi cizgiyi fitille delen barlar (close temiz).
       if (tl.posteriorPierces && tl.posteriorPierces.length) {
         var totalPierces = tl.posteriorPierceCount != null ? tl.posteriorPierceCount : tl.posteriorPierces.length;
         var shownLabel = totalPierces > tl.posteriorPierces.length
@@ -1305,6 +1379,7 @@ function showDetail(s) {
         });
       }
 
+      // Son kapanis kirilimi (gecmiste) — broken=false ama recentCloseBreak dolu.
       if (tl.recentCloseBreak) {
         var rcb = tl.recentCloseBreak;
         var rcbDir = rcb.direction === 'up' ? 'yukari' : rcb.direction === 'down' ? 'asagi' : (rcb.direction || '?');
@@ -1314,6 +1389,7 @@ function showDetail(s) {
         }));
       }
 
+      // Esik ozeti — kullanici cizginin hangi toleranslarla degerlendirildigini gorsun.
       if (tl.thresholds) {
         var th = tl.thresholds;
         tlBox.appendChild(el('div', {
@@ -1326,9 +1402,15 @@ function showDetail(s) {
     renderTrendline(s.trendlineContext.support);
     renderTrendline(s.trendlineContext.resistance);
 
+    // Trendline Plan Adaylari (Commit 2) — respect_pullback / breakout_retest
+    // ADVISORY: bunlar gercek emir plani DEGIL, trendline-tabanli setup adaylari.
+    // Grader entry/SL'ini etkilemez. Olcum/observation amacli.
+    // Plan etiketleri rol-bazli (egim isaretinden bagimsiz). Cizginin gercek tipi
+    // (yukselen/dusen) plan kayit satirinda `Tip` olarak ayrica gosterilir, boylece
+     // yukselen_direnc/dusen_destek gibi yeni tipler de dogru sunulur.
     var planLabels = {
-      respect_pullback_long: 'Yukselen destege geri donus (long)',
-      respect_pullback_short: 'Dusen direnge geri donus (short)',
+      respect_pullback_long: 'Destege geri donus (long)',
+      respect_pullback_short: 'Direnge geri donus (short)',
       breakout_retest_long: 'Kirilan direncin retest\'i (long)',
       breakout_retest_short: 'Kirilan destegin retest\'i (short)',
     };
@@ -1345,7 +1427,11 @@ function showDetail(s) {
           textContent: '▸ ' + label,
           style: { fontSize: '11px', color: dirCol, padding: '4px 0 1px', fontWeight: 'bold' },
         }));
+        // p.source artik gercek cizgi tipini tasiyor (rising_support / falling_support /
+        // rising_resistance / falling_resistance). Etikete tip adini da ekle.
+        var typeNameTr = tlKindLabel[p.source] || p.source || '?';
         var parts = [
+          'Tip: ' + typeNameTr,
           'Entry ' + fmt(p.entry),
           'SL ' + fmt(p.sl),
           'Risk %' + (p.riskPct != null ? p.riskPct : '-'),
@@ -1369,6 +1455,7 @@ function showDetail(s) {
       });
     }
 
+    // Trendline motorundan gelen sistem warning'leri (pencere yetersizligi vb.)
     var tlEngineWarnings = s.trendlineContext.warnings || [];
     if (tlEngineWarnings.length) {
       tlBox.appendChild(el('div', {
@@ -1397,9 +1484,12 @@ function showDetail(s) {
       });
     }
 
-    tlHeader.onclick = function() { tlBox.style.display = tlBox.style.display === 'none' ? 'block' : 'none'; };
-    content.appendChild(tlHeader);
-    content.appendChild(tlBox);
+    // Iki cizgi de gizlendiyse ve plan/not/uyari da yoksa basligi hic gosterme.
+    if (tlBox.childNodes.length) {
+      tlHeader.onclick = function() { tlBox.style.display = tlBox.style.display === 'none' ? 'block' : 'none'; };
+      content.appendChild(tlHeader);
+      content.appendChild(tlBox);
+    }
   }
 
   // Warnings

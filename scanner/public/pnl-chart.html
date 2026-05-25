@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kumulatif P&L (Canli)</title>
+<style>
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --border: #30363d;
+    --text: #c9d1d9; --text2: #8b949e; --text3: #6e7681;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff; --orange: #ff9800;
+  }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 16px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .btn { background: transparent; color: var(--text); border: 1px solid var(--border); padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; text-decoration: none; }
+  .btn:hover { border-color: var(--blue); }
+  .btn.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+  .summary { display: flex; gap: 16px; padding: 8px 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .stat { display: flex; flex-direction: column; min-width: 80px; }
+  .stat .lbl { font-size: 10px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat .val { font-size: 18px; font-weight: bold; }
+  .chart-wrap { background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+  .legend { display: flex; gap: 16px; font-size: 12px; margin-bottom: 8px; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+  .empty { text-align: center; padding: 40px; color: var(--text2); }
+  #tooltip { position: fixed; pointer-events: none; background: #000; border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font-size: 11px; color: var(--text); display: none; z-index: 10; white-space: nowrap; }
+  svg text { fill: var(--text2); font-size: 10px; }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <a href="/" class="btn">&larr; Ana Sayfa</a>
+  <a href="/signals.html" class="btn">Acik Sinyaller</a>
+  <a href="/closed-24h.html" class="btn">Son 24s Kapanan</a>
+  <a href="/closed-24h-leagues.html" class="btn">Gercek &amp; Ara Lig</a>
+  <a href="/closed-24h-categories.html" class="btn">Kripto &amp; ABD Hisse</a>
+  <button class="btn" onclick="load()" style="border-color: var(--green); color: var(--green);">Yenile</button>
+  <span style="margin-left: 12px; color: var(--text2); font-size: 11px;">Birim:</span>
+  <button class="btn unit active" data-u="pct">%</button>
+  <button class="btn unit" data-u="usd">$</button>
+  <span style="color: var(--text2); font-size: 11px; margin-left: auto;" id="genAt"></span>
+</div>
+<h2 style="margin: 0 0 4px; color: var(--blue);">Gunluk Gerceklesen P&amp;L (24s)</h2>
+<div style="color: var(--text2); font-size: 11px; margin-bottom: 12px;" id="subtitle"></div>
+
+<div class="summary" id="summary"></div>
+
+<div class="chart-wrap">
+  <div class="legend">
+    <span><span class="swatch" style="height:12px;background:#3fb950;opacity:0.95;"></span> Real lig (dolu bar — bot gercekten aldi)</span>
+    <span><span class="swatch" style="height:12px;background:#3fb950;opacity:0.40;"></span> Tum kapanan (soluk bar — entry dolan)</span>
+    <span style="color:var(--text2);">Yesil = gunluk karda, Kirmizi = zararda</span>
+  </div>
+  <div id="chart"></div>
+</div>
+<div id="tooltip"></div>
+
+<script>
+var SVGNS = 'http://www.w3.org/2000/svg';
+var data = null;
+var unit = 'pct'; // 'pct' | 'usd'
+
+function svgEl(t, a) { var n = document.createElementNS(SVGNS, t); for (var k in a) n.setAttribute(k, a[k]); return n; }
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+function emptyMsg(host, msg) { var d = document.createElement('div'); d.className = 'empty'; d.textContent = msg; host.appendChild(d); }
+function fmtVal(v) {
+  if (v == null || !isFinite(v)) return '-';
+  var sign = v >= 0 ? '+' : '-';
+  var abs = Math.abs(v).toFixed(2);
+  return unit === 'usd' ? (sign + '$' + abs) : (sign + abs + '%');
+}
+function load() {
+  fetch('/api/signals/pnl-timeseries?since=2026-05-01').then(function(r){return r.json();}).then(function(d){
+    data = d;
+    document.getElementById('genAt').textContent = 'Guncel: ' + new Date(d.generatedAt || Date.now()).toLocaleString('tr-TR');
+    document.getElementById('subtitle').textContent =
+      'Baslangic: ' + new Date(d.since).toLocaleDateString('tr-TR') + '  |  USD taban: $' + d.base + '/trade  |  60 sn\'de bir otomatik yenilenir';
+    renderSummary();
+    renderChart();
+  }).catch(function(e){
+    var host = document.getElementById('chart'); clear(host); emptyMsg(host, 'Yuklenemedi: ' + e.message);
+  });
+}
+
+function renderSummary() {
+  var host = document.getElementById('summary');
+  clear(host);
+  if (!data) return;
+  var r = data.summary.real, a = data.summary.all;
+  var rWR = (r.wins + r.losses) > 0 ? Math.round(r.wins * 100 / (r.wins + r.losses)) : null;
+  var aWR = (a.wins + a.losses) > 0 ? Math.round(a.wins * 100 / (a.wins + a.losses)) : null;
+  var rVal = unit === 'usd' ? r.finalUsd : r.finalPct;
+  var aVal = unit === 'usd' ? a.finalUsd : a.finalPct;
+  var stats = [
+    { lbl: 'Real lig P&L', val: fmtVal(rVal), color: rVal >= 0 ? 'var(--green)' : 'var(--red)' },
+    { lbl: 'Real n / WR', val: r.count + (rWR != null ? ' / %' + rWR : ''), color: 'var(--text)' },
+    { lbl: 'Tum kapanan P&L', val: fmtVal(aVal), color: aVal >= 0 ? 'var(--green)' : 'var(--red)' },
+    { lbl: 'Tum n / WR', val: a.count + (aWR != null ? ' / %' + aWR : ''), color: 'var(--text)' },
+  ];
+  stats.forEach(function(st){
+    var box = document.createElement('div'); box.className = 'stat';
+    var l = document.createElement('span'); l.className = 'lbl'; l.textContent = st.lbl;
+    var v = document.createElement('span'); v.className = 'val'; v.textContent = st.val; v.style.color = st.color;
+    box.appendChild(l); box.appendChild(v); host.appendChild(box);
+  });
+}
+
+function dayVal(bucket) { return unit === 'usd' ? bucket.pnlUsd : bucket.pnlPct; }
+
+function renderChart() {
+  var host = document.getElementById('chart');
+  clear(host);
+  if (!data) return;
+  var days = data.daily || [];
+  if (!days.length) {
+    emptyMsg(host, '1 Mayis\'tan bu yana gun verisi yok.');
+    return;
+  }
+
+  var W = Math.max(640, host.clientWidth || 900), H = 460;
+  var m = { top: 16, right: 16, bottom: 30, left: 56 };
+  var iw = W - m.left - m.right;
+  var volH = 90;                 // alt hacim paneli yuksekligi
+  var gap = 14;                  // P&L paneli ile hacim paneli arasi
+  var pnlH = H - m.top - m.bottom - volH - gap;
+  var volTop = m.top + pnlH + gap;
+
+  // X: gun indeksine gore esit aralikli (kategorik — TradingView gibi)
+  var n = days.length;
+  var colW = iw / n;
+  var xc = function(i){ return m.left + colW * (i + 0.5); }; // gun merkezi
+
+  // P&L y-ekseni (real + all gunluk degerler)
+  var vals = [0];
+  days.forEach(function(d){ vals.push(dayVal(d.all)); vals.push(dayVal(d.real)); });
+  var vMin = Math.min.apply(null, vals), vMax = Math.max.apply(null, vals);
+  var vpad = (vMax - vMin) * 0.1 || 1; vMin -= vpad; vMax += vpad;
+  var y = function(v){ return m.top + (vMax - v) / (vMax - vMin) * pnlH; };
+
+  // Hacim y-ekseni (gunluk kapanan sinyal sayisi — all)
+  var maxVol = 1;
+  days.forEach(function(d){ if (d.all.count > maxVol) maxVol = d.all.count; });
+  var vy = function(c){ return volTop + volH - (c / maxVol) * volH; };
+
+  var svg = svgEl('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H });
+
+  // --- P&L panel grid + y etiket ---
+  var ticks = 5;
+  for (var i = 0; i <= ticks; i++) {
+    var vv = vMin + (vMax - vMin) * i / ticks;
+    var yy = y(vv);
+    svg.appendChild(svgEl('line', { x1: m.left, y1: yy, x2: W - m.right, y2: yy, stroke: '#21262d', 'stroke-width': 1 }));
+    var lbl = svgEl('text', { x: m.left - 6, y: yy + 3, 'text-anchor': 'end' });
+    lbl.textContent = unit === 'usd' ? ('$' + vv.toFixed(0)) : (vv.toFixed(1) + '%');
+    svg.appendChild(lbl);
+  }
+  if (vMin < 0 && vMax > 0) {
+    svg.appendChild(svgEl('line', { x1: m.left, y1: y(0), x2: W - m.right, y2: y(0), stroke: '#6e7681', 'stroke-width': 1, 'stroke-dasharray': '4 3' }));
+  }
+
+  // --- Hacim paneli cerceve + etiket ---
+  svg.appendChild(svgEl('line', { x1: m.left, y1: volTop + volH, x2: W - m.right, y2: volTop + volH, stroke: '#30363d', 'stroke-width': 1 }));
+  var volLbl = svgEl('text', { x: m.left - 6, y: volTop + 10, 'text-anchor': 'end' });
+  volLbl.textContent = maxVol;
+  svg.appendChild(volLbl);
+  var volTitle = svgEl('text', { x: m.left, y: volTop - 3 });
+  volTitle.textContent = 'Hacim — kapanan sinyal / gun';
+  svg.appendChild(volTitle);
+
+  // --- Hacim barlari (gunluk kapanan sayisi, gun P&L isaretine gore renk) ---
+  var barW = Math.max(1, colW * 0.7);
+  days.forEach(function(d, i){
+    if (!d.all.count) return;
+    var h = (volTop + volH) - vy(d.all.count);
+    var pos = d.all.pnlPct >= 0;
+    svg.appendChild(svgEl('rect', {
+      x: xc(i) - barW / 2, y: vy(d.all.count), width: barW, height: Math.max(1, h),
+      fill: pos ? 'rgba(63,185,80,0.55)' : 'rgba(248,81,73,0.55)'
+    }));
+  });
+
+  // --- X etiketleri (en fazla ~10 tarih) ---
+  var step = Math.max(1, Math.ceil(n / 10));
+  for (var k = 0; k < n; k += step) {
+    var tx = xc(k);
+    var dl = svgEl('text', { x: tx, y: H - 8, 'text-anchor': 'middle' });
+    var parts = days[k].date.split('-');
+    dl.textContent = parts[2] + '.' + parts[1];
+    svg.appendChild(dl);
+  }
+
+  // --- Gunluk P&L barlari (kazanc=yesil, zarar=kirmizi). Grup: real (dolu) + tum (soluk) ---
+  var y0 = y(0);
+  var barW = Math.max(2, colW * 0.30);
+  function drawBars(key, offset, opacity) {
+    days.forEach(function(day, i){
+      var b = day[key];
+      if (!b.count) return;
+      var v = dayVal(b);
+      var yv = y(v);
+      var top = Math.min(yv, y0), h = Math.max(1, Math.abs(yv - y0));
+      var green = v >= 0;
+      svg.appendChild(svgEl('rect', {
+        x: xc(i) + offset - barW / 2, y: top, width: barW, height: h,
+        fill: green ? '#3fb950' : '#f85149', opacity: opacity,
+        stroke: green ? '#3fb950' : '#f85149', 'stroke-width': 0.5
+      }));
+    });
+  }
+  drawBars('real', -colW * 0.17, 0.95);  // real lig — dolu
+  drawBars('all', colW * 0.17, 0.40);    // tum kapanan — soluk
+
+  // --- Hover noktalari (gun bazinda) ---
+  var tip = document.getElementById('tooltip');
+  function showTip(ev, day) {
+    clear(tip);
+    var b = document.createElement('b'); b.textContent = day.date;
+    tip.appendChild(b);
+    tip.appendChild(document.createElement('br'));
+    tip.appendChild(document.createTextNode('Real: ' + fmtDay(day.real) + ' (' + day.real.count + ' sinyal)'));
+    tip.appendChild(document.createElement('br'));
+    tip.appendChild(document.createTextNode('Tum: ' + fmtDay(day.all) + ' (' + day.all.count + ' sinyal)'));
+    tip.style.display = 'block';
+    tip.style.left = (ev.clientX + 12) + 'px';
+    tip.style.top = (ev.clientY + 12) + 'px';
+  }
+  function fmtDay(bucket) { var v = dayVal(bucket); return fmtVal(v); }
+  days.forEach(function(day, i){
+    var hit = svgEl('rect', { x: m.left + colW * i, y: m.top, width: colW, height: pnlH + gap + volH, fill: 'transparent' });
+    hit.style.cursor = 'pointer';
+    hit.addEventListener('mousemove', function(ev){ showTip(ev, day); });
+    hit.addEventListener('mouseleave', function(){ tip.style.display = 'none'; });
+    svg.appendChild(hit);
+  });
+
+  host.appendChild(svg);
+}
+
+document.querySelectorAll('.btn.unit').forEach(function(b){
+  b.addEventListener('click', function(){
+    document.querySelectorAll('.btn.unit').forEach(function(x){ x.classList.remove('active'); });
+    b.classList.add('active');
+    unit = b.dataset.u;
+    renderSummary();
+    renderChart();
+  });
+});
+window.addEventListener('resize', function(){ if (data) renderChart(); });
+
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>

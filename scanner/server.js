@@ -1218,11 +1218,121 @@ app.get('/api/signals/closed-24h', (req, res) => {
     const wins = enriched.filter(x => x.outcome === 'tp3_hit' || x.outcome === 'tp2_hit' || x.outcome === 'tp1_hit' || x.outcome === 'trailing_stop_exit').length;
     const losses = enriched.filter(x => x.outcome === 'sl_hit').length;
     const neutral = enriched.length - wins - losses;
+    // Toplam P&L: gerceklesmis (entry dolmus) sinyallerde pnlPct toplami ve R toplami.
+    const realized = enriched.filter(x => x.entryHit && x.pnlPct != null && Number.isFinite(x.pnlPct));
+    const totalPnlPct = Math.round(realized.reduce((a, x) => a + x.pnlPct, 0) * 100) / 100;
+    const withR = enriched.filter(x => x.actualRR != null && Number.isFinite(x.actualRR));
+    const totalR = Math.round(withR.reduce((a, x) => a + x.actualRR, 0) * 100) / 100;
     res.json({
       hours,
       generatedAt: new Date().toISOString(),
-      summary: { total: enriched.length, wins, losses, neutral },
+      summary: {
+        total: enriched.length, wins, losses, neutral,
+        realizedCount: realized.length,
+        totalPnlPct,
+        avgPnlPct: realized.length ? Math.round((totalPnlPct / realized.length) * 100) / 100 : null,
+        totalR,
+      },
       signals: enriched,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Kumulatif gerceklesen P&L zaman serisi (varsayilan 2026-05-01'den itibaren).
+// Iki seri: 'real' (botun gercekten aldigi real lig) ve 'all' (entry'si dolan
+// tum kapanan sinyaller). USD, $100/trade taban konvansiyonu ile pnlPct'e birebir.
+app.get('/api/signals/pnl-timeseries', (req, res) => {
+  try {
+    const sinceStr = req.query.since || '2026-05-01';
+    const sinceTs = new Date(sinceStr).getTime();
+    const since = Number.isFinite(sinceTs) ? sinceTs : new Date('2026-05-01').getTime();
+    const base = Math.max(1, Number(req.query.base) || 100); // USD taban: trade basi $
+
+    const realizedPnlPct = (s) => {
+      if (!s.entry || !Number.isFinite(s.entry)) return null;
+      if (s.entryHit === false) return null;
+      let exitPx = null;
+      if (s.status === 'trailing_stop_exit' && s.slHitPrice != null) exitPx = s.slHitPrice;
+      else if (s.tp3Hit && s.tp3 != null) exitPx = s.tp3;
+      else if (s.tp2Hit && s.tp2 != null) exitPx = s.tp2;
+      else if (s.tp1Hit && s.tp1 != null) exitPx = s.tp1;
+      else if (s.slHit && (s.slHitPrice != null || s.sl != null)) exitPx = s.slHitPrice != null ? s.slHitPrice : s.sl;
+      else if (s.lastCheckedPrice != null) exitPx = s.lastCheckedPrice;
+      if (exitPx == null || !Number.isFinite(exitPx)) return null;
+      const reward = s.direction === 'long' ? (exitPx - s.entry) : (s.entry - exitPx);
+      return Math.round((reward / s.entry) * 10000) / 100;
+    };
+
+    const archived = readAllArchives();
+    const resolvedTime = (s) => new Date(s.resolvedAt || s.entryExpiredAt || s.updatedAt || 0).getTime();
+    const pool = archived
+      .filter(s => {
+        const t = resolvedTime(s);
+        return Number.isFinite(t) && t >= since && s.entryHit !== false && realizedPnlPct(s) != null;
+      })
+      .map(s => ({
+        t: resolvedTime(s),
+        symbol: s.symbol,
+        grade: s.grade,
+        league: s.league || null,
+        outcome: s.outcome || s.status,
+        pnlPct: realizedPnlPct(s),
+        actualRR: s.actualRR != null ? s.actualRR : null,
+      }))
+      .sort((a, b) => a.t - b.t);
+
+    // Yerel takvim gunu anahtari (kullanici saati — gun siniri 00:00 yerel).
+    const dayKey = (ts) => {
+      const d = new Date(ts);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+    const usd = (pct) => Math.round(pct * (base / 100) * 100) / 100;
+
+    // since'ten bugune tum takvim gunlerini uret (bos gunler sifir-dolgulu).
+    const dayList = [];
+    {
+      const start = new Date(since); start.setHours(0, 0, 0, 0);
+      const end = new Date(); end.setHours(0, 0, 0, 0);
+      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+        dayList.push(dayKey(d.getTime()));
+      }
+    }
+    const blankBucket = () => ({ pnlPct: 0, count: 0, wins: 0, losses: 0 });
+    const realRows = pool.filter(r => r.league === 'real');
+    const aggregate = (rows) => {
+      const byDay = {};
+      dayList.forEach(k => { byDay[k] = blankBucket(); });
+      let cum = 0, wins = 0, losses = 0;
+      rows.forEach(r => {
+        const k = dayKey(r.t);
+        if (!byDay[k]) byDay[k] = blankBucket();
+        byDay[k].pnlPct += r.pnlPct;
+        byDay[k].count++;
+        if (r.pnlPct > 0) { byDay[k].wins++; wins++; } else if (r.pnlPct < 0) { byDay[k].losses++; losses++; }
+        cum += r.pnlPct;
+      });
+      return { byDay, finalPct: Math.round(cum * 100) / 100, finalUsd: usd(Math.round(cum * 100) / 100), count: rows.length, wins, losses };
+    };
+
+    const aggAll = aggregate(pool);
+    const aggReal = aggregate(realRows);
+    const daily = dayList.map(date => {
+      const a = aggAll.byDay[date], r = aggReal.byDay[date];
+      const round = (b) => ({ pnlPct: Math.round(b.pnlPct * 100) / 100, pnlUsd: usd(Math.round(b.pnlPct * 100) / 100), count: b.count, wins: b.wins, losses: b.losses });
+      return { date, all: round(a), real: round(r) };
+    });
+
+    res.json({
+      since: new Date(since).toISOString(),
+      base,
+      generatedAt: new Date().toISOString(),
+      summary: {
+        real: { count: aggReal.count, wins: aggReal.wins, losses: aggReal.losses, finalPct: aggReal.finalPct, finalUsd: aggReal.finalUsd },
+        all: { count: aggAll.count, wins: aggAll.wins, losses: aggAll.losses, finalPct: aggAll.finalPct, finalUsd: aggAll.finalUsd },
+      },
+      daily,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });

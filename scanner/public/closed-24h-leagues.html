@@ -2,7 +2,7 @@
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
-<title>Son 24 Saatte Kapanan Sinyaller</title>
+<title>Kapanan — Gercek & Ara Lig</title>
 <style>
   :root {
     --bg: #0d1117; --bg2: #161b22; --border: #30363d;
@@ -20,6 +20,8 @@
   .filter-bar { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
   .filter-btn { background: transparent; color: var(--text2); border: 1px solid var(--border); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; }
   .filter-btn.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+  .league-btn.active { background: var(--orange); color: #000; border-color: var(--orange); }
+  .filter-label { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.5px; align-self: center; margin-right: 4px; }
   .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 10px; cursor: pointer; transition: border-color 0.15s; }
   .card:hover { border-color: var(--blue); }
   .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
@@ -47,15 +49,22 @@
 <div class="toolbar">
   <a href="/" class="btn">&larr; Ana Sayfa</a>
   <a href="/signals.html" class="btn">Acik Sinyaller</a>
-  <a href="/closed-24h-leagues.html" class="btn">Gercek &amp; Ara Lig</a>
+  <a href="/closed-24h.html" class="btn">Tum Kapananlar</a>
   <a href="/closed-24h-categories.html" class="btn">Kripto &amp; ABD Hisse</a>
   <a href="/pnl-chart.html" class="btn">P&amp;L Grafik</a>
   <button class="btn" onclick="load()" style="border-color: var(--green); color: var(--green);">Yenile</button>
   <span style="color: var(--text2); font-size: 11px; margin-left: auto;" id="genAt"></span>
 </div>
-<h2 style="margin: 0 0 12px; color: var(--blue);">Son 24 Saatte Kapanan Sinyaller</h2>
+<h2 style="margin: 0 0 12px; color: var(--blue);">Son 24 Saatte Kapanan — Gercek &amp; Ara Lig</h2>
 <div class="summary" id="summary"></div>
+<div class="filter-bar" id="leagueBar">
+  <span class="filter-label">Lig</span>
+  <button class="filter-btn league-btn active" data-l="real_ara">Gercek + Ara</button>
+  <button class="filter-btn league-btn" data-l="real">Gercek Lig</button>
+  <button class="filter-btn league-btn" data-l="ara">Ara Lig</button>
+</div>
 <div class="filter-bar" id="filterBar">
+  <span class="filter-label">Sonuc</span>
   <button class="filter-btn active" data-f="all">Tumu</button>
   <button class="filter-btn" data-f="win">Kazanc</button>
   <button class="filter-btn" data-f="loss">Kayip</button>
@@ -71,6 +80,7 @@ function fmtPnl(v){return v==null||!isFinite(v)?'?':(v>=0?'+$':'-$')+Math.abs(Nu
 
 var allSignals = [];
 var currentFilter = 'all';
+var currentLeague = 'real_ara';
 
 function classifyOutcome(s) {
   var o = s.outcome || s.status;
@@ -79,9 +89,17 @@ function classifyOutcome(s) {
   return 'neutral';
 }
 
+// Bu sekme yalnizca gercek + ara lig sinyallerini kapsar; virtual haric.
+function inLeagueScope(s) { return s.league === 'real' || s.league === 'ara'; }
+
+function matchLeague(s) {
+  if (currentLeague === 'real_ara') return inLeagueScope(s);
+  return s.league === currentLeague;
+}
+
 function load() {
   fetch('/api/signals/closed-24h?hours=24').then(function(r){return r.json();}).then(function(d){
-    allSignals = d.signals || [];
+    allSignals = (d.signals || []).filter(inLeagueScope);
     document.getElementById('genAt').textContent = 'Guncel: ' + new Date(d.generatedAt || Date.now()).toLocaleString('tr-TR');
     render();
   }).catch(function(e){
@@ -142,6 +160,7 @@ function render() {
   var host = document.getElementById('cards');
   clear(host);
   var list = allSignals.filter(function(s){
+    if (!matchLeague(s)) return false;
     if (currentFilter === 'all') return true;
     return classifyOutcome(s) === currentFilter;
   });
@@ -234,6 +253,15 @@ document.querySelectorAll('#filterBar .filter-btn').forEach(function(b){
     document.querySelectorAll('#filterBar .filter-btn').forEach(function(x){ x.classList.remove('active'); });
     b.classList.add('active');
     currentFilter = b.dataset.f;
+    render();
+  });
+});
+
+document.querySelectorAll('#leagueBar .league-btn').forEach(function(b){
+  b.addEventListener('click', function(){
+    document.querySelectorAll('#leagueBar .league-btn').forEach(function(x){ x.classList.remove('active'); });
+    b.classList.add('active');
+    currentLeague = b.dataset.l;
     render();
   });
 });
