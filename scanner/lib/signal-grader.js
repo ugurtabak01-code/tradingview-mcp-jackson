@@ -22,6 +22,7 @@ import { checkBlackout } from './blackout.js';
 import { applyAlignmentFilters } from './alignment-filters.js';
 import { detectVolumeReaction } from './volume-reaction-detector.js';
 import { formatBarTime } from './formation-detector.js';
+import { buildTrendlineSignalContext } from './trendline-engine.js';
 import { detectPumpTop, pumpPullbackLevel } from './pump-guard.js';
 import { loadFibCache } from './fib-engine.js';
 import { buildStrategicLevels, pickStrategicTp2Tp3 } from './strategic-tp-engine.js';
@@ -821,6 +822,8 @@ export function gradeShortTermSignal({
   // Patch 2 — shadow primitives. tallyVotes'a girmez; sadece result objesine
   // surface eder (shadowMetrics + shadowVotes alanlari).
   shadow = null,
+  // Trendline advisory — grade/vote'a katki yok; sadece reasoning/warnings.
+  trendlines = null,
 }) {
   const result = {
     symbol, timeframe,
@@ -841,6 +844,8 @@ export function gradeShortTermSignal({
     // okumaz; sadece dashboard / API / learning replay icin gozlem datasi.
     shadowMetrics: null,
     shadowVotes: null,
+    // Trendline advisory context — ilk surumde grade'e katilmaz, sadece bilgi.
+    trendlineContext: null,
     // REGIME_GATES kalibrasyonu icin instrumentation (2026-05-12). Hicbir
     // gate'i etkilemez — sadece archive record'a tasinabilir hale getirir,
     // boylece sonraki haftalarda gercek outcome bucket'lariyla esleme
@@ -945,6 +950,24 @@ export function gradeShortTermSignal({
   // Add all vote reasonings
   for (const v of votes) {
     result.reasoning.push(v.reasoning);
+  }
+
+  // Trendline advisory — yon belli olunca attach. Grade/vote'u DEGISTIRMEZ;
+  // sadece reasoning (notes) + warnings (riskFlags) bilgisi dusurur. Outcome
+  // korelasyonu temiz cikarsa ilerde dusuk agirlikli vote eklenebilir.
+  if (trendlines && result.direction) {
+    result.trendlineContext = buildTrendlineSignalContext(trendlines, result.direction);
+    for (const n of result.trendlineContext.notes || []) {
+      result.reasoning.push(`[Trendline] ${n}`);
+    }
+    for (const r of result.trendlineContext.riskFlags || []) {
+      result.warnings.push(`[Trendline] ${r}`);
+    }
+    // Trendline motorundan gelen pencere/bar yetersizligi warning'leri de
+    // result.warnings'e tasinir (Codex bug taramasi Bulgu 3).
+    for (const w of result.trendlineContext.warnings || []) {
+      result.warnings.push(`[Trendline] ${w}`);
+    }
   }
 
   // Berabere veya hiç direktif oy yoksa → yön belirsiz, BEKLE.

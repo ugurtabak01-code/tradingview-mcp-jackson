@@ -590,6 +590,10 @@ export function recordSignal(scanResult) {
     sameDir.indicators = extractIndicatorSnapshot(scanResult);
     sameDir.reasoning = scanResult.reasoning || sameDir.reasoning;
     sameDir.barrierSummary = scanResult.barrierSummary || sameDir.barrierSummary || null;
+    // Trendline advisory — her taramada taze hesaplanir, upsert'te guncellenir.
+    if (scanResult.trendlineContext !== undefined) {
+      sameDir.trendlineContext = scanResult.trendlineContext || null;
+    }
     sameDir.warnings = [
       ...(scanResult.warnings || []),
       ...(sameDir.warnings || []).filter(w => typeof w === 'string' && w.startsWith('REVERSE SINYAL:')),
@@ -802,6 +806,11 @@ export function recordSignal(scanResult) {
     reasoning: scanResult.reasoning || [],
     warnings: scanResult.warnings || [],
     barrierSummary: scanResult.barrierSummary || null,
+
+    // Trendline advisory context — structured support/resistance verisi.
+    // Grade/votes/RR/yon kararlarina etki etmez; kart + archive + outcome
+    // korelasyonu icin saklanir.
+    trendlineContext: scanResult.trendlineContext || null,
 
     // Tracking state
     createdAt: now.toISOString(),

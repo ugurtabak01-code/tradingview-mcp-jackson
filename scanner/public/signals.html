@@ -1154,6 +1154,219 @@ function showDetail(s) {
     content.appendChild(vbBox);
   }
 
+  // Trendline detay paneli — capa/temas/wick-pierce/kirilim + plan adaylari +
+  // esikler + motor uyarilari. Advisory: grade'e etki yok.
+  // 2026-05-20 — pierced cizgi plan uretebilir (anlik wick trendi bozmaz).
+  if (s.trendlineContext && (
+    s.trendlineContext.support
+    || s.trendlineContext.resistance
+    || (s.trendlineContext.warnings && s.trendlineContext.warnings.length)
+  )) {
+    var tlDate = function(t) {
+      if (t == null) return '?';
+      var ms = Number(t) < 1e12 ? Number(t) * 1000 : Number(t);
+      var d = new Date(ms);
+      return isNaN(d.getTime()) ? '?' : d.toLocaleString('tr-TR', {
+        day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit',
+      });
+    };
+    // Codex ddc8f75 — 4 trendline tipi:
+    //   rising_support     : taban, pozitif egim   → yesil
+    //   falling_support    : taban, negatif egim   → yesil (yine taban, ama dusuyor)
+    //   falling_resistance : tavan, negatif egim   → kirmizi
+    //   rising_resistance  : tavan, pozitif egim   → kirmizi (yukselen tavan)
+    var tlKindLabel = {
+      rising_support: 'Yukselen Destek',
+      falling_support: 'Dusen Destek',
+      falling_resistance: 'Dusen Direnc',
+      rising_resistance: 'Yukselen Direnc',
+    };
+    var tlKindColor = {
+      rising_support: 'var(--green)',
+      falling_support: 'var(--green)',
+      falling_resistance: 'var(--red)',
+      rising_resistance: 'var(--red)',
+    };
+
+    var tlHeader = el('div', {
+      textContent: 'Trendline — temas noktalari & kategori — tikla ac/kapat',
+      style: { marginTop: '12px', fontSize: '11px', color: 'var(--blue)', textTransform: 'uppercase', letterSpacing: '0.5px', cursor: 'pointer', userSelect: 'none' },
+    });
+    var tlBox = el('div', { style: { display: 'none', marginTop: '4px' } });
+
+    var renderTrendline = function(tl) {
+      if (!tl) return;
+      var col = tlKindColor[tl.type] || 'var(--text2)';
+      var statusBits = [];
+      statusBits.push(tl.confirmed ? 'Onayli (' + tl.touchCount + ' temas)' : 'Aday (' + tl.touchCount + ' temas)');
+      if (tl.broken) {
+        statusBits.push('KIRILMIS (kapanisla, son bar)');
+      } else if (tl.recentCloseBreak) {
+        statusBits.push('Gecmiste kirildi (' + tl.recentCloseBreak.ageBars + ' bar once)');
+      }
+      if (tl.pierced) {
+        var pierceTotal = tl.posteriorPierceCount != null
+          ? tl.posteriorPierceCount
+          : (tl.posteriorPierces ? tl.posteriorPierces.length : '?');
+        statusBits.push('Wick delinmis (' + pierceTotal + ' nokta)');
+      }
+      if (tl.tooSteep) statusBits.push('cok dik');
+
+      tlBox.appendChild(el('div', {
+        textContent: (tlKindLabel[tl.type] || tl.type) + ' — ' + statusBits.join(' · '),
+        style: { marginTop: '6px', fontSize: '11px', fontWeight: 'bold', color: col },
+      }));
+
+      var slopeDir = tl.slope > 0 ? 'yukari egimli' : tl.slope < 0 ? 'asagi egimli' : 'yatay';
+      [
+        ['Kategori', (tl.slope > 0 ? 'Yukselen' : 'Dusen') + ' trend (' + slopeDir + ')'],
+        ['Guven', tl.confidence != null ? '%' + Math.round(tl.confidence * 100) : '-'],
+        ['Cizgi guncel deger', fmt(tl.currentValue) + (tl.distancePct != null ? ' (fiyat ' + (tl.distancePct >= 0 ? '+' : '') + tl.distancePct.toFixed(2) + '% uzakta)' : '')],
+      ].forEach(function(r) {
+        tlBox.appendChild(el('div', { className: 'detail-row' }, [
+          el('span', { className: 'dlabel', textContent: r[0] }),
+          el('span', { textContent: r[1], style: { fontSize: '11px' } }),
+        ]));
+      });
+
+      tlBox.appendChild(el('div', {
+        textContent: 'Capa noktalari (cizgiyi tanimlar):',
+        style: { fontSize: '10px', color: 'var(--text2)', padding: '4px 0 2px' },
+      }));
+      (tl.points || []).forEach(function(p, i) {
+        tlBox.appendChild(el('div', {
+          textContent: '• P' + (i + 1) + ': ' + tlDate(p.time) + ' @ ' + fmt(p.price),
+          style: { fontSize: '11px', color: 'var(--text)', padding: '1px 0' },
+        }));
+      });
+
+      if (tl.touches && tl.touches.length) {
+        tlBox.appendChild(el('div', {
+          textContent: 'Temas noktalari (' + tl.touches.length + '):',
+          style: { fontSize: '10px', color: 'var(--text2)', padding: '4px 0 2px' },
+        }));
+        tl.touches.forEach(function(p) {
+          tlBox.appendChild(el('div', {
+            textContent: '◦ ' + tlDate(p.time) + ' @ ' + fmt(p.price),
+            style: { fontSize: '11px', color: col, padding: '1px 0' },
+          }));
+        });
+      }
+
+      if (tl.posteriorPierces && tl.posteriorPierces.length) {
+        var totalPierces = tl.posteriorPierceCount != null ? tl.posteriorPierceCount : tl.posteriorPierces.length;
+        var shownLabel = totalPierces > tl.posteriorPierces.length
+          ? tl.posteriorPierces.length + '/' + totalPierces + ' gosteriliyor (son ' + tl.posteriorPierces.length + ')'
+          : totalPierces;
+        tlBox.appendChild(el('div', {
+          textContent: 'Wick ihlal noktalari (' + shownLabel + ' — close temiz):',
+          style: { fontSize: '10px', color: 'var(--text2)', padding: '4px 0 2px' },
+        }));
+        tl.posteriorPierces.forEach(function(p) {
+          tlBox.appendChild(el('div', {
+            textContent: '⚠ ' + tlDate(p.time) + ' @ ' + fmt(p.price) + ' (cizgi ' + fmt(p.lineValue) + ', tasma ' + fmt(p.distance) + ')',
+            style: { fontSize: '11px', color: '#e0a64a', padding: '1px 0' },
+          }));
+        });
+      }
+
+      if (tl.recentCloseBreak) {
+        var rcb = tl.recentCloseBreak;
+        var rcbDir = rcb.direction === 'up' ? 'yukari' : rcb.direction === 'down' ? 'asagi' : (rcb.direction || '?');
+        tlBox.appendChild(el('div', {
+          textContent: 'Son kapanis kirilimi: ' + tlDate(rcb.time) + ' @ ' + fmt(rcb.price) + ' (cizgi ' + fmt(rcb.lineValue) + ', ' + rcb.ageBars + ' bar once, yon: ' + rcbDir + ')',
+          style: { fontSize: '11px', color: tl.broken ? 'var(--red)' : '#e0a64a', padding: '4px 0 2px', fontStyle: 'italic' },
+        }));
+      }
+
+      if (tl.thresholds) {
+        var th = tl.thresholds;
+        tlBox.appendChild(el('div', {
+          textContent: 'Esikler — ATR ' + fmt(th.atr) + ' · temas ' + fmt(th.touch) + ' · interior reject ' + fmt(th.interiorHardReject) + ' · wick pierce ' + fmt(th.posteriorPierce) + ' · close break ' + fmt(th.closeBreak),
+          style: { fontSize: '10px', color: 'var(--text2)', padding: '4px 0 0', lineHeight: '1.4' },
+        }));
+      }
+    };
+
+    renderTrendline(s.trendlineContext.support);
+    renderTrendline(s.trendlineContext.resistance);
+
+    var planLabels = {
+      respect_pullback_long: 'Yukselen destege geri donus (long)',
+      respect_pullback_short: 'Dusen direnge geri donus (short)',
+      breakout_retest_long: 'Kirilan direncin retest\'i (long)',
+      breakout_retest_short: 'Kirilan destegin retest\'i (short)',
+    };
+    var planCandidates = s.trendlineContext.trendlinePlanCandidates || [];
+    if (planCandidates.length) {
+      tlBox.appendChild(el('div', {
+        textContent: 'Trendline Plan Adaylari (advisory — grade\'e etki yok):',
+        style: { fontSize: '10px', color: 'var(--blue)', padding: '8px 0 2px', textTransform: 'uppercase', letterSpacing: '0.3px' },
+      }));
+      planCandidates.forEach(function(p) {
+        var label = planLabels[p.planType] || p.planType;
+        var dirCol = p.direction === 'long' ? 'var(--green)' : 'var(--red)';
+        tlBox.appendChild(el('div', {
+          textContent: '▸ ' + label,
+          style: { fontSize: '11px', color: dirCol, padding: '4px 0 1px', fontWeight: 'bold' },
+        }));
+        var parts = [
+          'Entry ' + fmt(p.entry),
+          'SL ' + fmt(p.sl),
+          'Risk %' + (p.riskPct != null ? p.riskPct : '-'),
+          'Cizgi ' + fmt(p.lineValue),
+        ];
+        if (p.breakAgeBars != null) parts.push('Kirilim yasi ' + p.breakAgeBars + ' bar');
+        if (p.lineConfidence != null) parts.push('Cizgi guven %' + Math.round(p.lineConfidence * 100));
+        tlBox.appendChild(el('div', {
+          textContent: parts.join(' · '),
+          style: { fontSize: '11px', color: 'var(--text)', padding: '1px 0 1px 12px', lineHeight: '1.4' },
+        }));
+        if (p.linePierced || p.lineBrokenNow) {
+          var warns = [];
+          if (p.lineBrokenNow) warns.push('cizgi su an kirik');
+          if (p.linePierced) warns.push('wick delinmis');
+          tlBox.appendChild(el('div', {
+            textContent: '   uyari: ' + warns.join(', '),
+            style: { fontSize: '10px', color: '#e0a64a', padding: '1px 0 2px 12px', fontStyle: 'italic' },
+          }));
+        }
+      });
+    }
+
+    var tlEngineWarnings = s.trendlineContext.warnings || [];
+    if (tlEngineWarnings.length) {
+      tlBox.appendChild(el('div', {
+        textContent: 'Trendline motoru uyarilari:',
+        style: { fontSize: '10px', color: 'var(--orange, #e0a64a)', padding: '6px 0 2px', textTransform: 'uppercase', letterSpacing: '0.3px' },
+      }));
+      tlEngineWarnings.forEach(function(w) {
+        tlBox.appendChild(el('div', {
+          textContent: '⚠ ' + w,
+          style: { fontSize: '10px', color: 'var(--yellow, #e0a64a)', padding: '1px 0' },
+        }));
+      });
+    }
+
+    var tlNotes = (s.trendlineContext.notes || []).concat(s.trendlineContext.riskFlags || []);
+    if (tlNotes.length) {
+      tlBox.appendChild(el('div', {
+        textContent: 'Notlar:',
+        style: { fontSize: '10px', color: 'var(--text2)', padding: '6px 0 2px' },
+      }));
+      tlNotes.forEach(function(n) {
+        tlBox.appendChild(el('div', {
+          textContent: '• ' + n,
+          style: { fontSize: '10px', color: 'var(--text2)', padding: '1px 0', fontStyle: 'italic' },
+        }));
+      });
+    }
+
+    tlHeader.onclick = function() { tlBox.style.display = tlBox.style.display === 'none' ? 'block' : 'none'; };
+    content.appendChild(tlHeader);
+    content.appendChild(tlBox);
+  }
+
   // Warnings
   if (s.warnings && s.warnings.length > 0) {
     content.appendChild(el('div', { textContent: 'Uyarilar:', style: { marginTop: '12px', fontSize: '11px', color: 'var(--orange)' } }));
