@@ -1420,30 +1420,33 @@ app.post('/api/signals/:id/close', async (req, res) => {
   try {
     const persistence = await import('./lib/learning/persistence.js');
     const { readJSON, writeJSON, dataPath, appendToArchive } = persistence;
+    const { buildArchiveRecord } = await import('./lib/learning/outcome-checker.js');
     const OPEN_PATH = dataPath('signals', 'open.json');
     const data = readJSON(OPEN_PATH, { signals: [] });
     const signal = data.signals.find(s => s.id === id);
     if (!signal) return res.status(404).json({ error: 'Sinyal bulunamadi' });
-    if (signal.status !== 'open') return res.status(400).json({ error: `Sinyal zaten ${signal.status} durumunda` });
+    // 'open' disindaki statuler (superseded_by_*, vb.) open.json'da takili kalmis
+    // terminal sinyallerdir — bunlari da arsive tasiyip listeden cikarmaya izin ver.
+    const supersededStatus = signal.status !== 'open' ? signal.status : null;
 
     const nowIso = new Date().toISOString();
-    signal.status = 'manual_close';
+    // reason 'invalid_data' → veri butunlugu bozuk kayit (orn. entry post-fill
+    // refresh ile ezilmis). invalid_data terminal status; classifyOutcome onu
+    // neutral sayar → win:null → learning'e dahil edilmez.
+    const closeStatus = reason === 'invalid_data' ? 'invalid_data' : 'manual_close';
+    signal.status = supersededStatus || closeStatus;
     signal.manualClose = true;
     signal.manualCloseAt = nowIso;
     signal.manualCloseReason = reason;
     signal.manualCloseNote = note;
     signal.resolvedAt = nowIso;
+    if (closeStatus === 'invalid_data') signal.invalidData = true;
 
-    // Arsive at (win hesaplamasini outcome-checker gibi yapalim)
-    const holdingMs = new Date(nowIso) - new Date(signal.createdAt);
-    const archiveRecord = {
-      ...signal,
-      outcome: 'manual_close',
-      holdingPeriodMinutes: Math.round(holdingMs / 60000),
-      maxFavorableExcursion: signal.highestFavorable,
-      maxAdverseExcursion: signal.lowestAdverse,
-      win: signal.tp1Hit || false,
-    };
+    // Arsive at — buildArchiveRecord win'i classifyOutcome ile uc-durumlu
+    // hesaplar (manual_close / invalid_data → neutral → win:null). Onceki
+    // `win: tp1Hit||false` mantigi, hit olmamis bir kapanisi yanlislikla
+    // 'kayip' (win:false) olarak isaretleyip learning'i zehirliyordu.
+    const archiveRecord = buildArchiveRecord(signal);
     const yearMonth = nowIso.slice(0, 7);
     appendToArchive(yearMonth, archiveRecord);
 

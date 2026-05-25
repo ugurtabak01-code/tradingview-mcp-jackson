@@ -98,8 +98,9 @@ export async function getOhlcv({ count, summary } = {}) {
       high: Math.max(...highs), low: Math.min(...lows),
       range: Math.round((Math.max(...highs) - Math.min(...lows)) * 100) / 100,
       change: Math.round((last.close - first.open) * 100) / 100,
-      change_pct: Math.round(((last.close - first.open) / first.open) * 10000) / 100 + '%',
-      avg_volume: Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length),
+      // Bug fix: first.open === 0 durumunda Infinity/NaN yerine null don.
+      change_pct: first.open ? Math.round(((last.close - first.open) / first.open) * 10000) / 100 + '%' : null,
+      avg_volume: volumes.length ? Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length) : 0,
       last_5_bars: bars.slice(-5),
     };
   }
@@ -344,7 +345,9 @@ export async function getStudyValues() {
               if (items) {
                 for (var i = 0; i < items.length; i++) {
                   var item = items[i];
-                  if (item._value && item._value !== '∅' && item._title) values[item._title] = item._value;
+                  // Bug fix: truthy check, sayisal 0 degerini atliyordu (orn. MACD=0).
+                  // Yalnizca null/undefined/bos string/no-data sembolu '∅' eleninir.
+                  if (item._title && item._value !== null && item._value !== undefined && item._value !== '' && item._value !== '∅') values[item._title] = item._value;
                 }
               }
             }

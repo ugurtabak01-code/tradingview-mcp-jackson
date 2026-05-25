@@ -68,7 +68,10 @@ test('1. trending_up 3 bar sonra onaylanır', () => {
   }));
   const r = feed(bars);
   assert.equal(r[0].regime, 'trending_up');           // ilk çağrı anında set
-  assert.equal(r[0].transitioned, true);
+  // İlk gözlem (bootstrap) semantik olarak GEÇİŞ değildir — 2026-05-02'de
+  // transitioned=false olarak işaretlendi (restart sonrası sahte self-loop
+  // transition kayıtlarını önlemek için, bkz. compute-regime.js#420).
+  assert.equal(r[0].transitioned, false);
   assert.equal(r[2].stableBars, 3);
   assert.equal(r[2].newPositionAllowed, true);        // histerezis doldu
 });

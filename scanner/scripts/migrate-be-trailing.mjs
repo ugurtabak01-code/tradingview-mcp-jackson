@@ -27,7 +27,10 @@ const now = new Date().toISOString();
 
 // ---------- 1) open.json ----------
 const openData = readJSON(OPEN_PATH, { signals: [] });
-fs.copyFileSync(OPEN_PATH, OPEN_PATH + '.pre-be-migration.bak');
+// Yedegi yalnizca daha once alinmadiysa al — yeniden calistirmada orijinal
+// (migration oncesi) yedegin migrate edilmis veriyle ezilmesini onler.
+const backupOnce = (p) => { const b = p + '.pre-be-migration.bak'; if (!fs.existsSync(b)) fs.copyFileSync(p, b); };
+backupOnce(OPEN_PATH);
 
 let openPatched = 0;
 for (const s of openData.signals) {
@@ -63,7 +66,7 @@ for (const fname of archiveFiles) {
   const signals = Array.isArray(raw) ? raw : raw.signals;
   if (!Array.isArray(signals)) continue;
 
-  fs.copyFileSync(fpath, fpath + '.pre-be-migration.bak');
+  backupOnce(fpath);
 
   let fileChanged = 0;
   for (const s of signals) {

@@ -35,7 +35,7 @@ export async function setInputs({ entity_id, inputs: inputsRaw }) {
   `);
 
   if (result && result.error) throw new Error(result.error);
-  return { success: true, entity_id, updated_inputs: result.updated_inputs };
+  return { success: true, entity_id, updated_inputs: result?.updated_inputs ?? {} };
 }
 
 export async function toggleVisibility({ entity_id, visible }) {
@@ -55,5 +55,5 @@ export async function toggleVisibility({ entity_id, visible }) {
   `);
 
   if (result && result.error) throw new Error(result.error);
-  return { success: true, entity_id, visible: result.visible };
+  return { success: true, entity_id, visible: result?.visible };
 }

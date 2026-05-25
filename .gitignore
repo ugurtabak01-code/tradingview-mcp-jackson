@@ -13,6 +13,12 @@ scanner/data/
 # Lokal ajan hatiralari
 .remember/
 
+# Claude Code lokal ayarlari (kullaniciya ozgu)
+.claude/
+
+# macOS finder cope
+.DS_Store
+
 # API anahtarlari / secret
 .env
 .env.*

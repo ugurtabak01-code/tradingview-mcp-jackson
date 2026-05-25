@@ -24,6 +24,10 @@ const DAYS = 30;
 const cutoff = Date.now() - DAYS * 24 * 60 * 60 * 1000;
 
 function loadArchive() {
+  if (!fs.existsSync(ARCHIVE_DIR)) {
+    console.error(`[report] Arsiv dizini bulunamadi: ${ARCHIVE_DIR}`);
+    process.exit(1);
+  }
   const files = fs.readdirSync(ARCHIVE_DIR).filter(f => /^\d{4}-\d{2}\.json$/.test(f));
   const all = [];
   for (const f of files) {

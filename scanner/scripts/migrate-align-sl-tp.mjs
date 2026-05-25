@@ -174,8 +174,15 @@ if (!Array.isArray(openData.signals)) {
 }
 
 if (APPLY) {
-  fs.copyFileSync(OPEN_PATH, OPEN_PATH + '.pre-align-migration.bak');
-  console.log(`[Migrate] Yedek: ${OPEN_PATH}.pre-align-migration.bak`);
+  // Yedek yalnizca ilk apply'da alinir — tekrar apply'da orijinal yedegin
+  // migrate edilmis veriyle ezilmesini onler.
+  const bak = OPEN_PATH + '.pre-align-migration.bak';
+  if (!fs.existsSync(bak)) {
+    fs.copyFileSync(OPEN_PATH, bak);
+    console.log(`[Migrate] Yedek: ${bak}`);
+  } else {
+    console.log(`[Migrate] Yedek zaten var, korunuyor: ${bak}`);
+  }
 }
 
 let inspected = 0, patched = 0, skippedTerminal = 0, skippedNoChange = 0;

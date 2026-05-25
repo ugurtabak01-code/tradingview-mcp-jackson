@@ -25,6 +25,22 @@ const DRAIN_INTERVAL_MS = 30_000;
 let drainTimer = null;
 let slAmendDrainTimer = null;
 
+// Kuyruk dosyasi read-modify-write'i async drain ile enqueue arasinda yarisabiliyor:
+// drain bir item'i POST ederken (await) gelen enqueue dosyaya yazsa bile, drain
+// bittiginde eski snapshot'tan turetilen `remaining`'i geri yazip yeni item'i
+// EZIYORDU (sinyal kaybi). Tum kuyruk mutasyonlarini tek bir promise zinciri
+// uzerinden serilestirerek bu race'i kapatiyoruz.
+function makeMutex() {
+  let chain = Promise.resolve();
+  return (task) => {
+    const run = chain.then(task, task);
+    chain = run.then(() => {}, () => {});
+    return run;
+  };
+}
+const mainQueueLock = makeMutex();
+const slQueueLock = makeMutex();
+
 function readQueue() {
   try {
     if (!fs.existsSync(QUEUE_PATH)) return [];
@@ -46,13 +62,15 @@ function writeQueue(items) {
 }
 
 function enqueue(payload) {
-  const q = readQueue();
-  // Ayni id zaten kuyruktaysa sakla sadece bir kopya
-  const id = payload?.reason?.id;
-  const existing = id ? q.findIndex(x => x?.reason?.id === id) : -1;
-  if (existing >= 0) q[existing] = { ...payload, queuedAt: Date.now() };
-  else q.push({ ...payload, queuedAt: Date.now() });
-  writeQueue(q);
+  return mainQueueLock(() => {
+    const q = readQueue();
+    // Ayni id zaten kuyruktaysa sakla sadece bir kopya
+    const id = payload?.reason?.id;
+    const existing = id ? q.findIndex(x => x?.reason?.id === id) : -1;
+    if (existing >= 0) q[existing] = { ...payload, queuedAt: Date.now() };
+    else q.push({ ...payload, queuedAt: Date.now() });
+    writeQueue(q);
+  });
 }
 
 async function tryPost(url, payload) {
@@ -67,21 +85,23 @@ async function tryPost(url, payload) {
   return r.json().catch(() => ({}));
 }
 
-async function drain(url) {
-  const q = readQueue();
-  if (!q.length) return { drained: 0, remaining: 0 };
-  const remaining = [];
-  let drained = 0;
-  for (const item of q) {
-    try {
-      await tryPost(url, item);
-      drained++;
-    } catch {
-      remaining.push(item);
+function drain(url) {
+  return mainQueueLock(async () => {
+    const q = readQueue();
+    if (!q.length) return { drained: 0, remaining: 0 };
+    const remaining = [];
+    let drained = 0;
+    for (const item of q) {
+      try {
+        await tryPost(url, item);
+        drained++;
+      } catch {
+        remaining.push(item);
+      }
     }
-  }
-  writeQueue(remaining);
-  return { drained, remaining: remaining.length };
+    writeQueue(remaining);
+    return { drained, remaining: remaining.length };
+  });
 }
 
 function ensureDrainTimer(url) {
@@ -160,12 +180,14 @@ function writeSlAmendQueue(items) {
 }
 
 function enqueueSlAmend(payload) {
-  const q = readSlAmendQueue();
-  const key = `${payload?.signalId}::${payload?.action}`;
-  const existing = q.findIndex(x => `${x?.signalId}::${x?.action}` === key);
-  if (existing >= 0) q[existing] = { ...payload, queuedAt: Date.now() };
-  else q.push({ ...payload, queuedAt: Date.now() });
-  writeSlAmendQueue(q);
+  return slQueueLock(() => {
+    const q = readSlAmendQueue();
+    const key = `${payload?.signalId}::${payload?.action}`;
+    const existing = q.findIndex(x => `${x?.signalId}::${x?.action}` === key);
+    if (existing >= 0) q[existing] = { ...payload, queuedAt: Date.now() };
+    else q.push({ ...payload, queuedAt: Date.now() });
+    writeSlAmendQueue(q);
+  });
 }
 
 function slAmendUrl() {
@@ -173,21 +195,23 @@ function slAmendUrl() {
     .replace(/\/api\/signals\/new\/?$/, '/api/signals/sl-amend');
 }
 
-async function drainSlAmend(url) {
-  const q = readSlAmendQueue();
-  if (!q.length) return { drained: 0, remaining: 0 };
-  const remaining = [];
-  let drained = 0;
-  for (const item of q) {
-    try {
-      await tryPost(url, item);
-      drained++;
-    } catch {
-      remaining.push(item);
+function drainSlAmend(url) {
+  return slQueueLock(async () => {
+    const q = readSlAmendQueue();
+    if (!q.length) return { drained: 0, remaining: 0 };
+    const remaining = [];
+    let drained = 0;
+    for (const item of q) {
+      try {
+        await tryPost(url, item);
+        drained++;
+      } catch {
+        remaining.push(item);
+      }
     }
-  }
-  writeSlAmendQueue(remaining);
-  return { drained, remaining: remaining.length };
+    writeSlAmendQueue(remaining);
+    return { drained, remaining: remaining.length };
+  });
 }
 
 function ensureSlAmendDrainTimer(url) {
@@ -241,7 +265,7 @@ export function dispatchSlAmend(payload) {
     try { await drainSlAmend(url); } catch {}
     try {
       await tryPost(url, payload);
-      console.log(`[sl-amend] dispatched ${id}/${action} seq=${payload.seq}`);
+      console.log(`[sl-amend] dispatched ${id}/${action} seq=${payload?.seq ?? 'n/a'}`);
     } catch (err) {
       console.warn(`[sl-amend] post failed (${id}/${action}): ${err.message} — queued`);
       enqueueSlAmend(payload);

@@ -449,6 +449,29 @@ function sanitizeSymbol(symbol) {
 }
 
 /**
+ * On-demand tek-sembol HTF fib refresh: hesapla + per-symbol cache dosyasina yaz.
+ * runHTFFibJob'un per-symbol adiminin tekil hali — scanner, bir sembolde fib
+ * cache eksik/bayatken sinyal acmadan ONCE bunu cagirir.
+ *
+ * Scan lock CAGIRAN tarafindan tutulmali; computeHTFFibsForSymbol lock almaz
+ * (runHTFFibJob'dan farkli). En az bir HTF TF gecerli fib uretmezse ok:false
+ * doner — cache yazilmaz, cagiran sinyali acmamali.
+ *
+ * @returns {Promise<{ ok:boolean, refreshed_at?:string, reason?:string }>}
+ */
+export async function refreshHTFFibForSymbol(symbol, category = null) {
+  const res = await computeHTFFibsForSymbol(symbol);
+  const tfOk = res && res.timeframes &&
+    Object.values(res.timeframes).some(t => t && t.fib && !t.error);
+  if (!tfOk) {
+    return { ok: false, reason: res?.error || 'gecerli HTF TF yok' };
+  }
+  if (category) res.category = category;
+  writeJSON(dataPath('fib', `${sanitizeSymbol(symbol)}.json`), res);
+  return { ok: true, refreshed_at: res.refreshed_at };
+}
+
+/**
  * Fib cache tazelik kontrolu. >= 24h ise true (stale).
  */
 export function isFibCacheStale(maxAgeMs = 24 * 60 * 60 * 1000) {

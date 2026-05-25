@@ -180,7 +180,7 @@ function calcADX(bars, period = 14) {
 function executeTrades(signals, bars, options = {}) {
   const slMult = options.slMultiplier || 2.5;
   const tpRatios = options.tpRatios || [1.5, 2.5, 4.0]; // R multiples
-  const maxConcurrent = 1; // One trade at a time
+  // const maxConcurrent = 1; // One trade at a time (kullanilmiyor, info amacli)
 
   const trades = [];
   let openTrade = null;
@@ -245,6 +245,8 @@ function executeTrades(signals, bars, options = {}) {
       entryBar: i,
       entryTime: bar.time,
       atr,
+      slDist, // BUG FIX: gercek 1R mesafesi sakla -> closeTrade dogru RR hesaplar
+      slMult,
       sl: dir === 'long' ? entry - slDist : entry + slDist,
       tp1: dir === 'long' ? entry + slDist * tpRatios[0] : entry - slDist * tpRatios[0],
       tp2: dir === 'long' ? entry + slDist * tpRatios[1] : entry - slDist * tpRatios[1],
@@ -276,7 +278,11 @@ function closeTrade(trade, bar, barIdx, price, result) {
   } else {
     trade.pnl = ((trade.entry - price) / trade.entry) * 100;
   }
-  trade.rr = trade.atr > 0 ? Math.abs(price - trade.entry) / (trade.atr * 2.5) : 0;
+  // BUG FIX (2026-05-15): RR = |fiyat-giris| / (1R mesafesi). 1R = atr * slMult.
+  // Onceki kod 2.5'i hardcode'luyordu -> slMultiplier 1.5/3/4 oldugunda
+  // raporlanan RR yanlisti (PF/expectancy etkilenmez ama RR alani guvenilmezdi).
+  const rDist = trade.slDist || (trade.atr > 0 ? trade.atr * (trade.slMult || 2.5) : 0);
+  trade.rr = rDist > 0 ? Math.round(Math.abs(price - trade.entry) / rDist * 100) / 100 : 0;
 }
 
 function computeStats(trades, strategyName) {
@@ -567,15 +573,20 @@ function stratSwingBreakPullback(bars) {
   let lastBreakHigh = null, lastBreakLow = null;
 
   for (let i = lookback * 2; i < bars.length; i++) {
+    // BUG FIX (2026-05-15): swing pivot LOOKAHEAD bias —
+    // pivot bar idx=K, lookback=L iken bar K+L'e kadar konfirme edilemez.
+    // Eski filtre `s.idx < i` yeterince siki degildi: runtime'da bar i'deyken
+    // i-L'den buyuk idx'li swingler henuz onaylanmamis sayilmali.
+    // Dogrusu: `s.idx + lookback < i` -> sadece tam konfirme olmus swingler.
     // Check for break above swing high
-    const recentHigh = swingHighs.filter(s => s.idx < i && s.idx > i - 50).pop();
+    const recentHigh = swingHighs.filter(s => s.idx + lookback < i && s.idx > i - 50).pop();
     if (recentHigh && bars[i].close > recentHigh.price && !lastBreakHigh) {
       lastBreakHigh = { price: recentHigh.price, bar: i };
       lastBreakLow = null;
     }
 
     // Check for break below swing low
-    const recentLow = swingLows.filter(s => s.idx < i && s.idx > i - 50).pop();
+    const recentLow = swingLows.filter(s => s.idx + lookback < i && s.idx > i - 50).pop();
     if (recentLow && bars[i].close < recentLow.price && !lastBreakLow) {
       lastBreakLow = { price: recentLow.price, bar: i };
       lastBreakHigh = null;

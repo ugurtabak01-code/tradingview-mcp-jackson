@@ -23,7 +23,6 @@ const ROOT = path.resolve(__dirname, '..');
 const OPEN = path.join(ROOT, 'data/signals/open.json');
 const ARCH_2026_05 = path.join(ROOT, 'data/signals/archive/2026-05.json');
 const FAULTY = path.join(ROOT, 'data/stats/faulty-trades.json');
-const LADDER = path.join(ROOT, 'data/ladder.json');
 
 const DRY = process.argv.includes('--dry-run');
 const REPORT = { open: { fixed: [], archived: [], skipped: [] }, archive: { flagged: [] }, faulty: { removed: [] }, ladder: { reverted: [] } };

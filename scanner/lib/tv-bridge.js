@@ -288,13 +288,28 @@ function parseTFToSeconds(tf) {
   // yapip '1m'i '1M'e cevirip ay sayiyordu → maxAge 30 gun, staleness check'i devre disi.
   const raw = String(tf);
   const s = raw.toUpperCase();
+  // Bug fix (2026-05-15): cok-gunluk/haftalik formatlar (2D, 3W, 4H) eski kodda
+  // yalnizca rakami isleyip dakika sayiyordu (orn. "2D" → 120sn). Bu yuzden
+  // getOhlcvValidated dogru taze veriyi bile "stale" isaretliyordu. Simdi
+  // \d+D, \d+W, \d+H, \d+M ('M' yalniz raw input ay icin) tanir.
   if (s === '1D' || s === 'D') return 86400;
   if (s === '1W' || s === 'W') return 604800;
   // Ay yalniz buyuk M ile (TradingView konvansiyonu)
   if (raw === '1M' || raw === 'M') return 2592000;
+
+  // Cok-gunluk/haftalik (raw 'M' ile karistirmamak icin once raw kontrolu)
+  const monthMatch = raw.match(/^(\d+)M$/); // ay (raw, kucuk-buyuk fark var)
+  if (monthMatch) return parseInt(monthMatch[1], 10) * 2592000;
+  const weekMatch = s.match(/^(\d+)W$/);
+  if (weekMatch) return parseInt(weekMatch[1], 10) * 604800;
+  const dayMatch = s.match(/^(\d+)D$/);
+  if (dayMatch) return parseInt(dayMatch[1], 10) * 86400;
+  const hourMatch = s.match(/^(\d+)H$/);
+  if (hourMatch) return parseInt(hourMatch[1], 10) * 3600;
+
   const n = parseInt(s, 10);
   if (isNaN(n)) return 3600; // fallback 1h
-  if (s.includes('H')) return n * 3600;
+  if (s.includes('H')) return n * 3600; // ekstra guvenlik (eski davranis)
   // 'm' suffix veya cıplak sayı → dakika
   return n * 60;
 }
@@ -343,7 +358,9 @@ export async function getStudyValues() {
               if (items) {
                 for (var i = 0; i < items.length; i++) {
                   var item = items[i];
-                  if (item._value && item._value !== '∅' && item._title) values[item._title] = item._value;
+                  // Bug fix (2026-05-15): truthy check sayisal 0'i atliyordu
+                  // (orn. MACD hist=0, oscillator=0). Sadece null/undefined/'' /'∅' eleninir.
+                  if (item._title && item._value !== null && item._value !== undefined && item._value !== '' && item._value !== '∅') values[item._title] = item._value;
                 }
               }
             }

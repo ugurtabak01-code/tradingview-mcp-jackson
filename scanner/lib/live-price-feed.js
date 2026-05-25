@@ -52,6 +52,15 @@ const BROADCAST_THROTTLE_MS = 1000;
 const IDLE_TIMEOUT_MS = 60_000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 
+// Bug fix (2026-05-15): reconnect storm korumasi. Onceki kod sabit 3sn delay
+// kullaniyordu; Binance kisa surede capraz disconnect ederse saatte yuzlerce
+// reconnect oluyordu (canli sistemde 281 reconnect tespit). Exponential backoff
+// ile baslangic 3sn, max 60sn. Her basarili connect sonrasi (lk mesaj geldikten
+// sonra) sayac sifirlanir.
+const RECONNECT_BASE_MS = 3_000;
+const RECONNECT_MAX_MS = 60_000;
+let _consecutiveReconnects = 0;
+
 /**
  * TV sembolunu Binance spot sembolune normalize et.
  * Ornekler:
@@ -157,6 +166,9 @@ export function registerSymbols(tvSymbols = []) {
 function handleTicker(tickers) {
   _stats.messagesReceived++;
   _stats.lastMessageAt = Date.now();
+  // Bug fix: ilk gercek mesaj geldikten sonra reconnect sayacini sifirla
+  // (saglikli connection = backoff'u bastan baslat).
+  if (_consecutiveReconnects > 0) _consecutiveReconnects = 0;
 
   if (!Array.isArray(tickers)) return;
 
@@ -274,7 +286,12 @@ function scheduleReconnect() {
   if (_stopped) return;
   if (_reconnectTimer) return;
   _stats.reconnects++;
-  const delay = 3000;
+  _consecutiveReconnects++;
+  // Bug fix: exponential backoff (3s -> 6s -> 12s -> 24s -> 48s -> cap 60s)
+  const delay = Math.min(
+    RECONNECT_BASE_MS * Math.pow(2, _consecutiveReconnects - 1),
+    RECONNECT_MAX_MS
+  );
   _reconnectTimer = setTimeout(() => {
     _reconnectTimer = null;
     connect();

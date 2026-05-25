@@ -32,7 +32,11 @@ if (!Array.isArray(data.signals)) {
   process.exit(1);
 }
 
-fs.copyFileSync(OPEN_PATH, OPEN_PATH + '.pre-reconciliation.bak');
+// Yedegi yalnizca ilk calistirmada al — yeniden calistirmada orijinal yedegin
+// migrate edilmis veriyle ezilmesini onler (script idempotent oldugundan onemli).
+if (!fs.existsSync(OPEN_PATH + '.pre-reconciliation.bak')) {
+  fs.copyFileSync(OPEN_PATH, OPEN_PATH + '.pre-reconciliation.bak');
+}
 
 let patched = 0;
 let alreadyHad = 0;
